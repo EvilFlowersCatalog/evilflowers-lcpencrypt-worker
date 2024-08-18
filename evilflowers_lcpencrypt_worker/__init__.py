@@ -40,7 +40,7 @@ except ImportError:
     logger.warning("OpenTelemetry not installed. Tracing disabled.")
 
 
-@app.task(bind=True)
+@app.task(bind=True, queue="evilflowers_lcpencrypt_worker")
 def lcpencrypt(
     self: Task,
     input_file: str,
