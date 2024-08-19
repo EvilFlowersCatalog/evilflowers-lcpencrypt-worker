@@ -28,4 +28,4 @@ USER celery
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 CMD celery -A evilflowers_lcpencrypt_worker status || exit 1
 
 # Set the entrypoint and command to run the Celery worker
-ENTRYPOINT ["celery", "-A", "evilflowers_lcpencrypt_worker", "worker", "-E"]
+ENTRYPOINT ["celery", "-A", "evilflowers_lcpencrypt_worker", "worker", "-Q", "evilflowers_lcpencrypt_worker", "-E"]
