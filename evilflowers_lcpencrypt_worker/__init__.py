@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Celery app with broker and include new settings
 app = Celery("evilflowers_lcpencrypt_worker", broker=os.getenv("BROKER", "redis://localhost:6379/0"))
+app.conf.broker_connection_retry_on_startup = True
 
 # Optional: Set up OpenTelemetry tracing if available
 try:
