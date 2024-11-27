@@ -23,7 +23,7 @@ def run_executable(
     kwargs_list = []
     for k, v in kwargs_dict.items():
         if v is not None:
-            if isinstance(v, bool):
+            if isinstance(v, bool) and v:
                 kwargs_list.append(f"{kwargs_key_prefix}{k}")
             else:
                 kwargs_list.append(f"{kwargs_key_prefix}{k}={v}")
