@@ -23,7 +23,10 @@ def run_executable(
     kwargs_list = []
     for k, v in kwargs_dict.items():
         if v is not None:
-            kwargs_list.append(f"{kwargs_key_prefix}{k}={v}")
+            if isinstance(v, bool):
+                kwargs_list.append(f"{kwargs_key_prefix}{k}")
+            else:
+                kwargs_list.append(f"{kwargs_key_prefix}{k}={v}")
 
     # Combine the executable path and arguments
     command = [executable_path] + (args_list or []) + (kwargs_list or {})
