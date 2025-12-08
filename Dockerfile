@@ -2,7 +2,7 @@ FROM golang:1.24 AS readium
 
 RUN go install github.com/readium/readium-lcp-server/lcpencrypt@latest
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Create a non-root user called 'celery' and set ownership of the directory
 RUN useradd --system --home /usr/local/src --shell /bin/bash celery \
