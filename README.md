@@ -38,8 +38,51 @@ docker run -d --name lcpencrypt-worker \
 
 ```bash
 poetry install
+
+# Run using the built-in entry point (recommended)
+poetry run python -m evilflowers_lcpencrypt_worker
+
+# Or specify custom queue
+poetry run python -m evilflowers_lcpencrypt_worker -Q high_priority
+
+# Or use the traditional celery command
 poetry run celery -A evilflowers_lcpencrypt_worker worker --loglevel=info
 ```
+
+### Using Python Module
+
+The worker can be started as a Python module with various options:
+
+```bash
+# Basic usage
+python -m evilflowers_lcpencrypt_worker
+
+# Specify queue
+python -m evilflowers_lcpencrypt_worker -Q custom_queue
+
+# With custom settings
+python -m evilflowers_lcpencrypt_worker \
+    --queue high_priority \
+    --loglevel debug \
+    --concurrency 4 \
+    --prefetch-multiplier 2
+
+# With autoscaling
+python -m evilflowers_lcpencrypt_worker \
+    --queue lcpencrypt \
+    --autoscale 10,3 \
+    --max-tasks-per-child 1000
+```
+
+Available options:
+- `-Q, --queue`: Queue name (default: `evilflowers_lcpencrypt_worker`)
+- `-l, --loglevel`: Logging level (default: `info`)
+- `-c, --concurrency`: Number of worker processes
+- `-n, --hostname`: Custom hostname
+- `-P, --pool`: Pool implementation (default: `prefork`)
+- `--prefetch-multiplier`: Tasks to prefetch per worker (default: 1)
+- `--max-tasks-per-child`: Max tasks before worker restart
+- `--autoscale`: Enable autoscaling (format: `MAX,MIN`)
 
 ## Usage
 
@@ -258,6 +301,7 @@ poetry run black evilflowers_lcpencrypt_worker/
 ```
 evilflowers_lcpencrypt_worker/
 ├── __init__.py          # Main Celery task and app
+├── __main__.py          # CLI entry point for starting worker
 ├── types.py             # TypedDict definitions
 └── helpers.py           # Executable runner utilities
 ```

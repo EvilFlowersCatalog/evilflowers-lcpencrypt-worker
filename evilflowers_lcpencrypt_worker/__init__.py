@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # Initialize Celery app
 app = Celery(
     "evilflowers_lcpencrypt_worker",
-    broker=os.getenv("BROKER", "redis://localhost:6379/0"),
+    broker=os.getenv("BROKER", "redis://localhost:6379/7"),
 )
 app.conf.broker_connection_retry_on_startup = True
 app.conf.task_track_started = True
