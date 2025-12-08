@@ -1,4 +1,4 @@
-FROM golang:1.22 AS readium
+FROM golang:1.24 AS readium
 
 RUN go install github.com/readium/readium-lcp-server/lcpencrypt@latest
 
