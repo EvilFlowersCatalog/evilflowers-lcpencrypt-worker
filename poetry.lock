@@ -1099,4 +1099,4 @@ observability = ["opentelemetry-api", "opentelemetry-exporter-otlp", "openteleme
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.12"
-content-hash = "d09734fbef1fa35bfc7a941681b7aed83b00826c979850c67ce8497b0e263489"
+content-hash = "a056229617e22f637d63462a05c30b332bceaeecc49aff41ec05a48841c4f256"
