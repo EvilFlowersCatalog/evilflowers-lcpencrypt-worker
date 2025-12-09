@@ -302,8 +302,10 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
 
     except ExecutableException as e:
         logger.error(f"LCP encryption failed for {input_file}: {e}")
-        logger.error(f"Stderr: {e.stderr}")
-        logger.error(f"Stdout: {e.stdout}")
+        logger.error(f"Command executed: {e.command}")
+        logger.error(f"Return code: {e.returncode}")
+        logger.error(f"Stderr:\n{e.stderr}")
+        logger.error(f"Stdout:\n{e.stdout}")
 
         return LCPEncryptResult(
             content_id=contentid or "unknown",
