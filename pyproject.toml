@@ -6,7 +6,7 @@ authors = ["Jakub Dubec <jakub.dubec@stuba.sk>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.14"
 celery = {version = "^5.5.0", extras = ["redis"]}
 opentelemetry-api = {version = "*", optional = true}
 opentelemetry-sdk = {version = "*", optional = true}
@@ -22,11 +22,11 @@ observability = [
 ]
 
 [tool.poetry.group.dev.dependencies]
-black = "^24.8.0"
+black = "^26.1.0"
 
 [tool.black]
 line-length = 119
-target-version = ['py312']
+target-version = ['py314']
 include = '\.pyi?$'
 exclude = '''
 /(
