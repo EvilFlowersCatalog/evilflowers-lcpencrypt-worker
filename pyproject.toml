@@ -23,6 +23,8 @@ observability = [
 
 [tool.poetry.group.dev.dependencies]
 black = "^26.1.0"
+pytest = "^8.0"
+pytest-cov = "^6.0"
 
 [tool.black]
 line-length = 119
@@ -36,6 +38,10 @@ exclude = '''
   | data
 )/
 '''
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
 
 [build-system]
 requires = ["poetry-core"]

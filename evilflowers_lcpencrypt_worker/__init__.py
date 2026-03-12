@@ -217,14 +217,16 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
     }
 
     # Add mode-specific parameters
-    if storage and url:
+    if storage:
         # Recommended mode: custom storage location
         if storage.startswith("s3:"):
             cmd_args["storage"] = storage
         else:
             cmd_args["storage"] = str(Path(storage_path) / storage)
-        cmd_args["url"] = url
-        cmd_args["filename"] = filename
+        if url:
+            cmd_args["url"] = url
+        if filename:
+            cmd_args["filename"] = filename
     elif output:
         # Legacy mode: temporary output location
         cmd_args["output"] = str(Path(storage_path) / output) if not output.startswith("/") else output
@@ -254,13 +256,13 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
         output_filename = filename or contentid or Path(input_file).stem
         if storage:
             if storage.startswith("s3:"):
-                output_location = f"{url}/{output_filename}"
+                output_location = f"{url}/{output_filename}" if url else output_filename
             else:
-                output_path = Path(storage_path) / storage / output_filename
-                output_location = f"{url}/{output_filename}"
+                output_path = str(Path(storage_path) / storage / output_filename)
+                output_location = f"{url}/{output_filename}" if url else output_path
         else:
-            output_path = Path(output or temp) / output_filename
-            output_location = str(output_path)
+            output_path = str(Path(output or temp) / output_filename)
+            output_location = output_path
 
         # Get file information (if file is local)
         mime_type = "application/octet-stream"
@@ -268,16 +270,22 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
         file_hash = ""
 
         if not storage or not storage.startswith("s3:"):
-            if Path(output_location).exists():
-                mime_type, file_size, file_hash = _get_file_info(output_location)
+            # Resolve the local file path for metadata extraction
+            if storage and not storage.startswith("s3:"):
+                local_file_path = str(Path(storage_path) / storage / output_filename)
             else:
-                # Try to find the encrypted file
+                local_file_path = str(Path(output or temp) / output_filename)
+
+            if Path(local_file_path).exists():
+                mime_type, file_size, file_hash = _get_file_info(local_file_path)
+            else:
+                # Try to find the encrypted file with common extensions
                 possible_extensions = [".epub", ".pdf", ".lpf", ".audiobook"]
                 for ext in possible_extensions:
-                    test_path = Path(str(output_location) + ext)
+                    test_path = Path(str(local_file_path) + ext)
                     if test_path.exists():
-                        output_location = str(test_path)
-                        mime_type, file_size, file_hash = _get_file_info(output_location)
+                        local_file_path = str(test_path)
+                        mime_type, file_size, file_hash = _get_file_info(local_file_path)
                         break
 
         # Extract content encryption key from output (if available)
