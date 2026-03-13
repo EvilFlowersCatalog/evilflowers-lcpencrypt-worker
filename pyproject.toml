@@ -8,18 +8,10 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.14"
 celery = {version = "^5.5.0", extras = ["redis"]}
-opentelemetry-api = {version = "*", optional = true}
-opentelemetry-sdk = {version = "*", optional = true}
-opentelemetry-exporter-otlp = {version = "*", optional = true}
-opentelemetry-instrumentation-celery = {version = "*", optional = true}
+logfire = {version = "*", extras = ["celery", "redis", "system-metrics"], optional = true}
 
 [tool.poetry.extras]
-observability = [
-    "opentelemetry-api",
-    "opentelemetry-sdk",
-    "opentelemetry-exporter-otlp",
-    "opentelemetry-instrumentation-celery"
-]
+observability = ["logfire"]
 
 [tool.poetry.group.dev.dependencies]
 black = "^26.1.0"

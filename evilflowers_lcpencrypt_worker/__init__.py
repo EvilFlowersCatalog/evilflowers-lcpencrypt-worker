@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Unpack
 
 from celery import Celery, Task
+from celery.signals import worker_init
 
 from evilflowers_lcpencrypt_worker.helpers import ExecutableException, run_executable
 from evilflowers_lcpencrypt_worker.types import (
@@ -38,27 +39,24 @@ app.conf.task_serializer = "json"
 app.conf.result_serializer = "json"
 app.conf.accept_content = ["json"]
 
-# Optional: Set up OpenTelemetry tracing if available
-try:
-    from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.instrumentation.celery import CeleryInstrumentor
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    service_name = os.getenv("OTEL_SERVICE_NAME", "evilflowers-lcpencrypt-worker")
-    resource = Resource(attributes={"service.name": service_name})
-    provider = TracerProvider(resource=resource)
-    processor = BatchSpanProcessor(OTLPSpanExporter())
-    provider.add_span_processor(processor)
-    trace.set_tracer_provider(provider)
+# Optional: Set up Logfire observability (initialized after fork via worker_init signal)
+@worker_init.connect()
+def _init_observability(*args: Any, **kwargs: Any) -> None:
+    try:
+        import logfire
 
-    CeleryInstrumentor().instrument()
-    logger.info("OpenTelemetry tracing initialized")
+        logfire.configure(
+            service_name=os.getenv("LOGFIRE_SERVICE_NAME", "evilflowers-lcpencrypt-worker"),
+            environment=os.getenv("LOGFIRE_ENVIRONMENT", "development"),
+        )
+        logfire.instrument_celery()
+        logfire.instrument_redis(capture_statement=False)
+        logfire.instrument_system_metrics()
+        logger.info("Logfire observability initialized")
 
-except ImportError:
-    logger.warning("OpenTelemetry not installed, tracing disabled")
+    except ImportError:
+        logger.warning("Logfire not installed, observability disabled")
 
 
 def _determine_storage_mode(storage: str | None) -> StorageMode:

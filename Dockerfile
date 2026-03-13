@@ -14,7 +14,7 @@ ENV READIUM_LCPENCRYPT_BIN=/usr/local/bin/lcpencrypt
 # Install the package (copies only what's needed)
 COPY pyproject.toml README.md ./
 COPY evilflowers_lcpencrypt_worker/ evilflowers_lcpencrypt_worker/
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir ".[observability]"
 
 # Healthcheck
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \

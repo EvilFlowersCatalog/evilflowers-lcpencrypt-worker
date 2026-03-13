@@ -31,8 +31,9 @@ Environment Variables:
   STORAGE_PATH                Base path for file storage (default: /mnt/data)
   READIUM_LCPENCRYPT_BIN      Path to lcpencrypt binary (default: lcpencrypt)
   LOG_LEVEL                   Logging level (default: INFO)
-  OTEL_SERVICE_NAME           Service name for OpenTelemetry
-  OTEL_EXPORTER_OTLP_ENDPOINT OpenTelemetry Collector endpoint
+  LOGFIRE_TOKEN                Logfire write token (enables observability)
+  LOGFIRE_SERVICE_NAME         Service name for Logfire (default: evilflowers-lcpencrypt-worker)
+  LOGFIRE_ENVIRONMENT          Environment name (default: development)
 
 Examples:
   python -m evilflowers_lcpencrypt_worker
