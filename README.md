@@ -174,10 +174,23 @@ Use these for modern deployments with custom storage:
 
 | Parameter | Type | Default | Description                                                 |
 |-----------|------|---------|-------------------------------------------------------------|
+| `title`   | str  | -       | Publication title, injected into the Readium package manifest for raw-PDF input (see below) |
+| `author`  | str  | -       | Publication author, injected into the Readium package manifest for raw-PDF input (see below) |
 | `temp`    | str  | `/tmp`  | Working directory for temporary files                       |
 | `lcpsv`   | str  | -       | License server endpoint (format: `http://user:pass@host`)   |
 | `notify`  | str  | -       | CMS notification endpoint (format: `http://user:pass@host`) |
 | `verbose` | bool | `False` | Enable verbose logging                                      |
+
+#### PDF title/author metadata
+
+`lcpencrypt` reads a PDF's title/author only from metadata embedded in the file, so a raw
+catalog PDF (which usually has none) ends up with a filename-derived title and no authors —
+Thorium then shows *"no title and no authors available"*. When `title` and/or `author` are
+provided for a PDF input, the worker first wraps the PDF into a minimal
+[Readium Web Publication](https://readium.org/webpub-manifest/) package whose `manifest.json`
+carries the metadata, then encrypts that package (`lcpencrypt` preserves an existing manifest).
+The resulting `.lcpdf` opens in reading apps with the correct title and author. EPUB inputs
+already carry OPF metadata and are unaffected. A missing/empty `author` is handled gracefully.
 
 ### Legacy Mode Parameters
 

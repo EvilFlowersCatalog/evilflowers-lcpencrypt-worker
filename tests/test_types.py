@@ -46,6 +46,8 @@ class TestLCPEncryptParams:
             "url",
             "contentid",
             "filename",
+            "title",
+            "author",
             "temp",
             "lcpsv",
             "notify",

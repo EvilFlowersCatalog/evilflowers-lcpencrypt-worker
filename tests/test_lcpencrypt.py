@@ -1,13 +1,21 @@
 """Tests for the lcpencrypt Celery task and helper functions."""
 
 import hashlib
+import json
 import os
+import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from evilflowers_lcpencrypt_worker import _determine_storage_mode, _get_file_info, lcpencrypt
+from evilflowers_lcpencrypt_worker import (
+    _build_pdf_readium_package,
+    _determine_storage_mode,
+    _get_file_info,
+    _looks_like_pdf,
+    lcpencrypt,
+)
 from evilflowers_lcpencrypt_worker.helpers import ExecutableException, ExecutableResult
 
 
@@ -97,9 +105,123 @@ class TestGetFileInfo:
         assert isinstance(sha256, str)
 
 
+class TestGetFileInfoLcpExtensions:
+    """The encrypted outputs use LCP-specific extensions unknown to mimetypes."""
+
+    @pytest.mark.parametrize(
+        "ext,expected_mime",
+        [
+            (".lcpdf", "application/pdf+lcp"),
+            (".lcpa", "application/audiobook+lcp"),
+            (".lcpdi", "application/divina+lcp"),
+            (".webpub", "application/webpub+lcp"),
+        ],
+    )
+    def test_lcp_extension_mime_types(self, tmp_path, ext, expected_mime):
+        f = tmp_path / f"encrypted{ext}"
+        f.write_bytes(b"encrypted-content")
+
+        mime_type, _, _ = _get_file_info(str(f))
+
+        assert mime_type == expected_mime
+
+
+class TestLooksLikePdf:
+    def test_local_pdf_path(self):
+        assert _looks_like_pdf("catalogs/x/book.pdf") is True
+
+    def test_uppercase_extension(self):
+        assert _looks_like_pdf("/mnt/data/BOOK.PDF") is True
+
+    def test_epub_is_not_pdf(self):
+        assert _looks_like_pdf("book.epub") is False
+
+    def test_http_url_with_query_string(self):
+        assert _looks_like_pdf("https://example.com/files/book.pdf?token=abc") is True
+
+    def test_http_url_non_pdf(self):
+        assert _looks_like_pdf("https://example.com/files/book.epub") is False
+
+
+class TestBuildPdfReadiumPackage:
+    def _read_manifest(self, package_path):
+        with zipfile.ZipFile(package_path) as archive:
+            names = archive.namelist()
+            manifest = json.loads(archive.read("manifest.json"))
+        return names, manifest
+
+    def test_package_contains_pdf_and_manifest(self, sample_pdf, tmp_path):
+        package_path = str(tmp_path / "out.rpf")
+
+        _build_pdf_readium_package(sample_pdf, package_path, "My Title", "Jane Doe")
+
+        names, manifest = self._read_manifest(package_path)
+        assert "publication.pdf" in names
+        assert "manifest.json" in names
+        assert manifest["metadata"]["title"] == "My Title"
+        assert manifest["metadata"]["author"] == "Jane Doe"
+        assert manifest["metadata"]["conformsTo"] == "https://readium.org/webpub-manifest/profiles/pdf"
+        assert manifest["readingOrder"] == [{"href": "publication.pdf", "type": "application/pdf"}]
+
+    def test_embedded_pdf_matches_source(self, sample_pdf, tmp_path):
+        package_path = str(tmp_path / "out.rpf")
+
+        _build_pdf_readium_package(sample_pdf, package_path, "T", "A")
+
+        with zipfile.ZipFile(package_path) as archive:
+            assert archive.read("publication.pdf") == Path(sample_pdf).read_bytes()
+
+    def test_missing_author_is_omitted(self, sample_pdf, tmp_path):
+        package_path = str(tmp_path / "out.rpf")
+
+        _build_pdf_readium_package(sample_pdf, package_path, "Only Title", None)
+
+        _, manifest = self._read_manifest(package_path)
+        assert manifest["metadata"]["title"] == "Only Title"
+        assert "author" not in manifest["metadata"]
+
+    def test_missing_title_falls_back_to_filename(self, tmp_path):
+        pdf = tmp_path / "the-book.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+        package_path = str(tmp_path / "out.rpf")
+
+        _build_pdf_readium_package(str(pdf), package_path, None, "Jane Doe")
+
+        _, manifest = self._read_manifest(package_path)
+        assert manifest["metadata"]["title"] == "the-book"
+
+    def test_unicode_metadata_preserved(self, sample_pdf, tmp_path):
+        package_path = str(tmp_path / "out.rpf")
+
+        _build_pdf_readium_package(sample_pdf, package_path, "Žižek: Naše", "Šimon Ő")
+
+        _, manifest = self._read_manifest(package_path)
+        assert manifest["metadata"]["title"] == "Žižek: Naše"
+        assert manifest["metadata"]["author"] == "Šimon Ő"
+
+
 def _call_lcpencrypt(**kwargs):
     """Call the lcpencrypt task directly (Celery handles self binding)."""
     return lcpencrypt.run(**kwargs)
+
+
+def _capture_package(holder):
+    """Return a run_executable side_effect that snapshots the input package.
+
+    The temporary Readium package is deleted after the task returns, so we read its
+    manifest while the binary is 'running' (before cleanup) and stash it in ``holder``.
+    """
+
+    def _side_effect(*args, **kwargs):
+        input_path = kwargs["kwargs_dict"]["input"]
+        holder["input"] = input_path
+        if input_path.endswith(".rpf") and Path(input_path).exists():
+            with zipfile.ZipFile(input_path) as archive:
+                holder["names"] = archive.namelist()
+                holder["manifest"] = json.loads(archive.read("manifest.json"))
+        return ExecutableResult(returncode=0, stdout="", stderr="")
+
+    return _side_effect
 
 
 class TestLcpencryptTask:
@@ -540,3 +662,161 @@ class TestLcpencryptTask:
 
         cmd_args = mock_run.call_args.kwargs.get("kwargs_dict") or mock_run.call_args[1].get("kwargs_dict")
         assert cmd_args["output"] == "/absolute/path/output"
+
+
+class TestPdfMetadataPackaging:
+    """Tests for injecting title/author into a raw PDF via a Readium package (issue #1)."""
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_pdf_with_title_and_author_is_repackaged(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        pdf = tmp_path / "book.pdf"
+        pdf.write_bytes(b"%PDF-1.4 real-pdf-bytes")
+
+        holder = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        result = _call_lcpencrypt(
+            input_file="book.pdf",
+            contentid="abc-uuid",
+            storage="encrypted",
+            filename="abc-uuid",
+            title="The Great Book",
+            author="Ada Lovelace",
+            temp=str(tmp_path / "tmp"),
+        )
+
+        assert result["success"] is True
+        # lcpencrypt was handed a Readium package, not the raw PDF
+        assert holder["input"].endswith(".rpf")
+        assert "publication.pdf" in holder["names"]
+        assert holder["manifest"]["metadata"]["title"] == "The Great Book"
+        assert holder["manifest"]["metadata"]["author"] == "Ada Lovelace"
+        assert holder["manifest"]["metadata"]["conformsTo"] == "https://readium.org/webpub-manifest/profiles/pdf"
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_pdf_with_only_title(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        pdf = tmp_path / "book.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        holder = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        result = _call_lcpencrypt(
+            input_file="book.pdf",
+            contentid="id",
+            title="Solo Title",
+            temp=str(tmp_path / "tmp"),
+        )
+
+        assert result["success"] is True
+        assert holder["input"].endswith(".rpf")
+        assert holder["manifest"]["metadata"]["title"] == "Solo Title"
+        assert "author" not in holder["manifest"]["metadata"]
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_pdf_without_metadata_is_not_repackaged(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        pdf = tmp_path / "book.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+
+        _call_lcpencrypt(input_file="book.pdf", contentid="id")
+
+        cmd_args = mock_run.call_args.kwargs.get("kwargs_dict") or mock_run.call_args[1].get("kwargs_dict")
+        # No title/author → raw PDF passed straight through
+        assert cmd_args["input"] == str(tmp_path / "book.pdf")
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_epub_with_metadata_is_not_repackaged(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        epub = tmp_path / "book.epub"
+        epub.write_bytes(b"PK\x03\x04")
+
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+
+        _call_lcpencrypt(
+            input_file="book.epub",
+            contentid="id",
+            title="Title",
+            author="Author",
+        )
+
+        cmd_args = mock_run.call_args.kwargs.get("kwargs_dict") or mock_run.call_args[1].get("kwargs_dict")
+        # EPUB carries OPF metadata; input must be untouched (never a .rpf)
+        assert cmd_args["input"] == str(tmp_path / "book.epub")
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_repackaging_cleans_up_temp_dir(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        pdf = tmp_path / "book.pdf"
+        pdf.write_bytes(b"%PDF-1.4")
+
+        temp_root = tmp_path / "tmp"
+        holder = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        _call_lcpencrypt(
+            input_file="book.pdf",
+            contentid="id",
+            title="Title",
+            temp=str(temp_root),
+        )
+
+        # The package existed during the run but is removed afterwards
+        assert not Path(holder["input"]).exists()
+        assert list(temp_root.glob("lcp-rwpp-*")) == []
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_packaging_failure_falls_back_to_raw_pdf(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        # Input PDF does not exist on disk → _build_pdf_readium_package raises, fallback kicks in
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+
+        result = _call_lcpencrypt(
+            input_file="missing.pdf",
+            contentid="id",
+            title="Title",
+            author="Author",
+            temp=str(tmp_path / "tmp"),
+        )
+
+        assert result["success"] is True
+        cmd_args = mock_run.call_args.kwargs.get("kwargs_dict") or mock_run.call_args[1].get("kwargs_dict")
+        # Falls back to the raw (unresolved) PDF path rather than crashing
+        assert cmd_args["input"] == str(tmp_path / "missing.pdf")
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_remote_pdf_is_downloaded_and_packaged(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        source_pdf = tmp_path / "source.pdf"
+        source_pdf.write_bytes(b"%PDF-1.4 remote")
+
+        def fake_urlretrieve(url, dest):
+            Path(dest).write_bytes(source_pdf.read_bytes())
+            return dest, None
+
+        holder = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        with patch("evilflowers_lcpencrypt_worker.urllib.request.urlretrieve", side_effect=fake_urlretrieve):
+            result = _call_lcpencrypt(
+                input_file="https://example.com/files/book.pdf?token=xyz",
+                contentid="id",
+                title="Remote Title",
+                author="Remote Author",
+                temp=str(tmp_path / "tmp"),
+            )
+
+        assert result["success"] is True
+        assert holder["input"].endswith(".rpf")
+        assert holder["manifest"]["metadata"]["title"] == "Remote Title"

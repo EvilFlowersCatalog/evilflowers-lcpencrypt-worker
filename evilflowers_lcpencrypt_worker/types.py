@@ -13,6 +13,10 @@ class LCPEncryptParams(TypedDict, total=False):
         url: Base URL associated with the storage. Must be a public URL corresponding to storage location.
         contentid: Unique identifier of the encrypted publication. If omitted, a UUID is generated.
         filename: File name of the encrypted publication. If omitted, contentid is used as filename.
+        title: Publication title. For raw-PDF input it is injected into the Readium package
+               manifest so reading apps (e.g. Thorium) display it. Ignored for EPUB (OPF wins).
+        author: Publication author. For raw-PDF input it is injected into the Readium package
+                manifest as a contributor. Ignored for EPUB (OPF wins).
         temp: Working folder for temporary files. Defaults to '/tmp'.
         lcpsv: Host name of the License Server to be notified. Format: http://username:password@example.com
         notify: Notification endpoint of a CMS. Format: http://username:password@example.com
@@ -32,6 +36,8 @@ class LCPEncryptParams(TypedDict, total=False):
     # Optional parameters
     contentid: str
     filename: str
+    title: str
+    author: str
     temp: str
     lcpsv: str
     notify: str

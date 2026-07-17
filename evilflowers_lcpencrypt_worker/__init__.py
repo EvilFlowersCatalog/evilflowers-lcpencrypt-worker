@@ -5,9 +5,15 @@ standard. This worker wraps the lcpencrypt command-line tool and provides a robu
 """
 
 import hashlib
+import json
 import logging
 import mimetypes
 import os
+import shutil
+import tempfile
+import urllib.parse
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any, Unpack
 
@@ -89,6 +95,14 @@ def _get_file_info(file_path: str) -> tuple[str, int, str]:
         # Default MIME types for common LCP formats
         if file_path.endswith(".epub"):
             mime_type = "application/epub+zip"
+        elif file_path.endswith(".lcpdf"):
+            mime_type = "application/pdf+lcp"
+        elif file_path.endswith(".lcpa"):
+            mime_type = "application/audiobook+lcp"
+        elif file_path.endswith(".lcpdi"):
+            mime_type = "application/divina+lcp"
+        elif file_path.endswith(".webpub"):
+            mime_type = "application/webpub+lcp"
         elif file_path.endswith(".pdf"):
             mime_type = "application/pdf"
         elif file_path.endswith(".audiobook"):
@@ -104,6 +118,86 @@ def _get_file_info(file_path: str) -> tuple[str, int, str]:
             sha256_hash.update(chunk)
 
     return mime_type, file_size, sha256_hash.hexdigest()
+
+
+# Readium Web Publication Manifest constants used when pre-packaging a raw PDF.
+RWPM_CONTEXT = "https://readium.org/webpub-manifest/context.jsonld"
+RWPM_PDF_PROFILE = "https://readium.org/webpub-manifest/profiles/pdf"
+
+
+def _looks_like_pdf(input_path: str) -> bool:
+    """Return True if the input locator points to a PDF (by extension).
+
+    Handles both file system paths and http(s) URLs (query strings are ignored).
+    """
+    path = urllib.parse.urlsplit(input_path).path if "://" in input_path else input_path
+    return path.lower().endswith(".pdf")
+
+
+def _localize_pdf(resolved_input: str, temp_dir: str) -> tuple[str, bool]:
+    """Ensure the PDF is available on the local file system.
+
+    Args:
+        resolved_input: File system path or http(s) URL of the source PDF.
+        temp_dir: Directory to download the file into if it is remote.
+
+    Returns:
+        Tuple of (local_path, downloaded) where ``downloaded`` is True if a temporary
+        copy was fetched and should be cleaned up by the caller.
+    """
+    if resolved_input.startswith(("http://", "https://")):
+        os.makedirs(temp_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=temp_dir)
+        os.close(fd)
+        urllib.request.urlretrieve(resolved_input, tmp_path)  # noqa: S310 (trusted catalog input)
+        return tmp_path, True
+    return resolved_input, False
+
+
+def _build_pdf_readium_package(
+    pdf_path: str,
+    package_path: str,
+    title: str | None,
+    author: str | None,
+) -> None:
+    """Wrap a raw PDF into a minimal Readium Package (RWPP) carrying bibliographic metadata.
+
+    Readium ``lcpencrypt`` reads a PDF's title/author only from metadata embedded in the
+    PDF itself; catalog PDFs usually carry none, so the generated package manifest falls
+    back to a filename-derived title and empty authors, and Thorium shows "no title and no
+    authors available". By pre-packaging the PDF into a Readium Web Publication whose
+    ``manifest.json`` metadata carries the title/author, ``lcpencrypt`` — which preserves an
+    existing manifest for ``.rpf``/``.webpub`` inputs — emits an encrypted ``.lcpdf`` with the
+    correct metadata.
+
+    Args:
+        pdf_path: Local path to the source PDF.
+        package_path: Destination path for the Readium package (should end in ``.rpf``).
+        title: Publication title. Falls back to the PDF file stem when empty.
+        author: Publication author. Omitted from the manifest when empty.
+    """
+    metadata: dict[str, Any] = {
+        "@type": "http://schema.org/Book",
+        "conformsTo": RWPM_PDF_PROFILE,
+        # RWPM requires a title; mirror lcpencrypt's filename fallback when none is provided.
+        "title": title or Path(pdf_path).stem,
+    }
+    # A missing/empty author yields an empty contributor list (no crash, no bogus author).
+    if author:
+        metadata["author"] = author
+
+    manifest = {
+        "@context": RWPM_CONTEXT,
+        "metadata": metadata,
+        "readingOrder": [
+            {"href": "publication.pdf", "type": "application/pdf"},
+        ],
+    }
+
+    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        # The PDF is deflated inside the package, matching lcpencrypt's own PDF wrapping.
+        archive.write(pdf_path, arcname="publication.pdf")
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
 
 @app.task(
@@ -138,6 +232,10 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
     Optional parameters:
         contentid: Unique content identifier (UUID generated if omitted)
         filename: Output filename (uses contentid if omitted)
+        title: Publication title. For raw-PDF input it is injected into the Readium package
+               manifest so reading apps (e.g. Thorium) show it. Ignored for EPUB.
+        author: Publication author. For raw-PDF input it is injected into the Readium package
+                manifest as a contributor. Ignored for EPUB.
         temp: Temporary working directory (default: /tmp)
         lcpsv: License server endpoint (format: http://user:pass@host)
         notify: CMS notification endpoint (format: http://user:pass@host)
@@ -184,6 +282,8 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
     url = params.get("url")
     contentid = params.get("contentid")
     filename = params.get("filename")
+    title = params.get("title")
+    author = params.get("author")
     temp = params.get("temp", "/tmp")
     lcpsv = params.get("lcpsv")
     notify = params.get("notify")
@@ -239,6 +339,28 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
     if password:
         cmd_args["password"] = password
 
+    # For raw-PDF input with bibliographic metadata, pre-package the PDF into a Readium
+    # Web Publication whose manifest carries the title/author. lcpencrypt has no title/author
+    # flags and reads PDF metadata only from the file itself, so without this the encrypted
+    # .lcpdf shows "no title / no authors" in Thorium. lcpencrypt preserves the manifest of an
+    # existing Readium package (.rpf), so we hand it the pre-built package instead of the PDF.
+    package_temp_dir: str | None = None
+    if (title or author) and _looks_like_pdf(resolved_input):
+        try:
+            os.makedirs(temp, exist_ok=True)
+            local_pdf, downloaded = _localize_pdf(resolved_input, temp)
+            package_temp_dir = tempfile.mkdtemp(prefix="lcp-rwpp-", dir=temp)
+            package_path = str(Path(package_temp_dir) / f"{Path(local_pdf).stem}.rpf")
+            _build_pdf_readium_package(local_pdf, package_path, title, author)
+            cmd_args["input"] = package_path
+            logger.info(f"Pre-packaged PDF into Readium package with metadata (title={title!r}, author={author!r})")
+            if downloaded:
+                os.remove(local_pdf)
+        except Exception as e:  # noqa: BLE001 - metadata injection is best-effort
+            # Fall back to encrypting the raw PDF: metadata won't be embedded, but
+            # encryption still succeeds (graceful degradation instead of a crash).
+            logger.warning(f"Failed to pre-package PDF with metadata, using raw input: {e}")
+
     try:
         # Execute lcpencrypt
         result = run_executable(
@@ -277,8 +399,10 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
             if Path(local_file_path).exists():
                 mime_type, file_size, file_hash = _get_file_info(local_file_path)
             else:
-                # Try to find the encrypted file with common extensions
-                possible_extensions = [".epub", ".pdf", ".lpf", ".audiobook"]
+                # Try to find the encrypted file with common extensions. lcpencrypt renames
+                # outputs to LCP-specific extensions (.pdf -> .lcpdf, audiobook -> .lcpa, etc.),
+                # so those must be probed alongside the raw source extensions.
+                possible_extensions = [".epub", ".lcpdf", ".lcpa", ".lcpdi", ".webpub", ".pdf", ".lpf", ".audiobook"]
                 for ext in possible_extensions:
                     test_path = Path(str(local_file_path) + ext)
                     if test_path.exists():
@@ -325,6 +449,11 @@ def lcpencrypt(self: Task, **params: Unpack[LCPEncryptParams]) -> LCPEncryptResu
             success=False,
             error=f"Encryption failed: {e}",
         )
+
+    finally:
+        # Clean up the temporary Readium package (and any downloaded PDF inside it).
+        if package_temp_dir is not None:
+            shutil.rmtree(package_temp_dir, ignore_errors=True)
 
 
 __all__ = ["app", "lcpencrypt", "LCPEncryptParams", "LCPEncryptResult"]
