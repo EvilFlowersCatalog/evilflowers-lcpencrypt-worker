@@ -34,6 +34,18 @@ This changelog suppose to follow rules defined in the [changelog.md](https://cha
 - **Changed**: `storage` without `url` fails the task up front (lcpencrypt v1.13.4+ refuses it);
   the "url optional" branch is gone
 - **Fixed**: `protected_content_location` now carries the extension lcpencrypt appended (`.lcpdf`, …)
+- **Added**: `report` param: the worker POSTs an `EncryptionReport` (success or failure, package
+  summary, sidecar path, never the content key) to the catalog once per task, with Basic auth from
+  the URL, a W3C `traceparent` and bounded retries, so a failed job no longer stays `pending`
+  ([#3](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/3))
+- **Fixed**: lcpencrypt v1.14 exits 0 after a failed `notify` call, having withdrawn the content
+  from the License Server; the task now returns `success: False` for it instead of success (#3)
+- **Fixed**: a failed run's `error` ends with lcpencrypt's reason from stdout instead of its last
+  stderr progress line (e.g. `Process as EPUB`)
+- **Added**: manifest sidecar `{storage}/{filename}.manifest.json` (`MANIFEST_SIDECAR`), the
+  `lcp.package.manifest` span event, the `package_preview` task and
+  `python -m evilflowers_lcpencrypt_worker.preview`, to check a package without Thorium
+  ([#4](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/4))
 
 ## 0.1.0 - TBD
 

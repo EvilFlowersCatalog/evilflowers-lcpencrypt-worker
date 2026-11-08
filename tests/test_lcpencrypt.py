@@ -1,5 +1,6 @@
 """Tests for the lcpencrypt Celery task and helper functions."""
 
+import base64
 import hashlib
 import io
 import json
@@ -16,6 +17,7 @@ from evilflowers_lcpencrypt_worker import (
     _get_file_info,
     _looks_like_pdf,
     lcpencrypt,
+    package_preview,
 )
 from evilflowers_lcpencrypt_worker.helpers import ExecutableException, ExecutableResult
 from tests.pdf_factory import Bookmark, write_pdf
@@ -899,3 +901,279 @@ class TestPdfEnrichment:
 
         assert result["success"] is True
         assert "cid.jpg" in holder["names"]
+
+
+REPORT_URL: Final = "http://lcp:secret@catalog:8000/readium/v1/hooks/encryption/result"
+
+
+def _catalog_task(tmp_path, **extra):
+    """A catalog-style PDF task against STORAGE_PATH=tmp_path, writing `enc/cid.lcpdf` on success."""
+    write_pdf(tmp_path / "book.pdf", pages=3, outline=[Bookmark("One", 0), Bookmark("Two", 2)])
+    params = {
+        "input_file": "book.pdf",
+        "contentid": "cid",
+        "filename": "cid",
+        "storage": "enc",
+        "url": "https://elvira.example/content",
+        "title": "T",
+        "authors": ["A", "B"],
+        "temp": str(tmp_path / "tmp"),
+    }
+    return params | extra
+
+
+def _writes_package(tmp_path, stdout=""):
+    def run(*args, **kwargs):
+        (tmp_path / "enc").mkdir(exist_ok=True)
+        (tmp_path / "enc" / "cid.lcpdf").write_bytes(b"PK-encrypted")
+        return ExecutableResult(returncode=0, stdout=stdout, stderr="")
+
+    return run
+
+
+class TestOutcomeReport:
+    """Issue #3: every outcome reaches the catalog's `report` URL."""
+
+    @patch("evilflowers_lcpencrypt_worker.send_report")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_success_is_reported_with_the_package_summary(self, mock_run, mock_send, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        mock_run.side_effect = _writes_package(tmp_path)
+
+        result = _call_lcpencrypt(**_catalog_task(tmp_path, report=REPORT_URL))
+
+        assert result["success"] is True
+        (url, payload), _ = mock_send.call_args
+        assert url == REPORT_URL
+        assert payload["contentid"] == "cid"
+        assert payload["success"] is True
+        assert payload["error"] == ""
+        assert payload["report"] == {
+            "cover": "rendered",
+            "pages": 3,
+            "toc_entries": 2,
+            "warnings": [],
+            "manifest": "enc/cid.manifest.json",
+            "protected_content_location": "https://elvira.example/content/cid.lcpdf",
+            "protected_content_type": "application/pdf+lcp",
+            "protected_content_length": len(b"PK-encrypted"),
+            "protected_content_sha256": hashlib.sha256(b"PK-encrypted").hexdigest(),
+        }
+        # The report URL is the worker's own: lcpencrypt never sees it.
+        assert "report" not in mock_run.call_args.kwargs["kwargs_dict"]
+
+    @patch("evilflowers_lcpencrypt_worker.send_report")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_lcpencrypt_failure_is_reported(self, mock_run, mock_send, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        mock_run.side_effect = ExecutableException("lcpencrypt", 1, "Error processing a publication : boom\n", "")
+
+        result = _call_lcpencrypt(**_catalog_task(tmp_path, report=REPORT_URL))
+
+        assert result["success"] is False
+        payload = mock_send.call_args.args[1]
+        assert payload["success"] is False
+        assert payload["error"] == result["error"]
+        assert "boom" in payload["error"]
+        # The package was built before lcpencrypt failed: the catalog sees what it carried.
+        assert payload["report"]["cover"] == "rendered"
+        assert "protected_content_location" not in payload["report"]
+
+    @patch("evilflowers_lcpencrypt_worker.send_report")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_refused_parameters_are_reported(self, mock_run, mock_send, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", "/mnt/data")
+
+        _call_lcpencrypt(input_file="book.pdf", contentid="cid", storage="enc", report=REPORT_URL)
+
+        mock_run.assert_not_called()
+        payload = mock_send.call_args.args[1]
+        assert payload["success"] is False
+        assert payload["error"] == "Invalid parameters: storage requires url"
+
+    @patch("evilflowers_lcpencrypt_worker.send_report")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_worker_bug_is_reported_and_raised(self, mock_run, mock_send, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", "/mnt/data")
+        mock_run.side_effect = RuntimeError("unexpected")
+
+        with pytest.raises(RuntimeError, match="unexpected"):
+            _call_lcpencrypt(input_file="book.epub", contentid="cid", report=REPORT_URL)
+
+        payload = mock_send.call_args.args[1]
+        assert payload["success"] is False
+        assert "unexpected" in payload["error"]
+
+    @patch("evilflowers_lcpencrypt_worker.send_report")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_no_report_url_no_request(self, mock_run, mock_send, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        mock_run.side_effect = _writes_package(tmp_path)
+
+        assert _call_lcpencrypt(**_catalog_task(tmp_path))["success"] is True
+
+        mock_send.assert_not_called()
+
+    @patch("evilflowers_lcpencrypt_worker.send_report", return_value=False)
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_failed_report_leaves_the_result_alone(self, mock_run, mock_send, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        mock_run.side_effect = _writes_package(tmp_path)
+
+        assert _call_lcpencrypt(**_catalog_task(tmp_path, report=REPORT_URL))["success"] is True
+
+
+class TestCmsNotificationWithdrawal:
+    """lcpencrypt v1.14 exits 0 after a failed `-notify`, having withdrawn the content again."""
+
+    @patch("evilflowers_lcpencrypt_worker.send_report")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_withdrawn_publication_is_a_failure(self, mock_run, mock_send, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        mock_run.side_effect = _writes_package(
+            tmp_path, stdout="Error notifying the CMS: the server returned an error 401\n"
+        )
+
+        result = _call_lcpencrypt(**_catalog_task(tmp_path, report=REPORT_URL))
+
+        assert result["success"] is False
+        assert result["error"] == (
+            "Encryption withdrawn from the License Server: Error notifying the CMS: the server returned an error 401"
+        )
+        assert mock_send.call_args.args[1]["success"] is False
+        # Nothing to inspect for a publication that is not lendable.
+        assert not (tmp_path / "enc" / "cid.manifest.json").exists()
+
+
+class TestManifestSidecar:
+    """Issue #4: the package's manifest next to the encrypted file."""
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_sidecar_is_the_packaged_manifest(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        holder: dict = {}
+        capture = _capture_package(holder)
+
+        def run(*args, **kwargs):
+            capture(*args, **kwargs)
+            return _writes_package(tmp_path)(*args, **kwargs)
+
+        mock_run.side_effect = run
+
+        _call_lcpencrypt(**_catalog_task(tmp_path))
+
+        sidecar = json.loads((tmp_path / "enc" / "cid.manifest.json").read_text())
+        assert sidecar == holder["manifest"]
+        assert sidecar["metadata"]["author"] == ["A", "B"]
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_sidecar_can_be_turned_off(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        monkeypatch.setenv("MANIFEST_SIDECAR", "false")
+        mock_run.side_effect = _writes_package(tmp_path)
+
+        _call_lcpencrypt(**_catalog_task(tmp_path))
+
+        assert sorted(path.name for path in (tmp_path / "enc").iterdir()) == ["cid.lcpdf"]
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_no_sidecar_without_a_built_package(self, mock_run, tmp_path, monkeypatch):
+        """EPUB (and PDF without metadata): lcpencrypt builds the package, there is no manifest of ours."""
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        (tmp_path / "enc").mkdir()
+        (tmp_path / "enc" / "cid.epub").write_bytes(b"PK")
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+
+        _call_lcpencrypt(input_file="book.epub", contentid="cid", filename="cid", storage="enc", url="https://x")
+
+        assert sorted(path.name for path in (tmp_path / "enc").iterdir()) == ["cid.epub"]
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_no_sidecar_for_s3(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(tmp_path / "book.pdf")
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+
+        result = _call_lcpencrypt(
+            input_file="book.pdf",
+            contentid="cid",
+            storage="s3:eu-west-3:bucket",
+            url="https://bucket",
+            title="T",
+            temp=str(tmp_path / "tmp"),
+        )
+
+        assert result["success"] is True
+        assert not list(tmp_path.glob("**/*.manifest.json"))
+
+
+class TestPackagePreview:
+    """Issue #4: what the reader will show, without encrypting anything."""
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_preview_returns_and_stores_manifest_and_cover(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        params = _catalog_task(tmp_path, report=REPORT_URL, notify="http://u:p@catalog/hook")
+
+        with patch("evilflowers_lcpencrypt_worker.send_report") as mock_send:
+            result = package_preview.run(**params)
+
+        mock_run.assert_not_called()
+        mock_send.assert_not_called()
+        assert result["success"] is True
+        assert result["error"] == ""
+        assert result["manifest"]["metadata"]["title"] == "T"
+        assert result["manifest"]["metadata"]["numberOfPages"] == 3
+        assert result["manifest"]["resources"] == [{"rel": ["cover"], "href": "cid.jpg", "type": "image/jpeg"}]
+        assert (result["cover"], result["pages"], result["toc_entries"]) == ("rendered", 3, 2)
+        cover = base64.b64decode(result["cover_jpeg_base64"])
+        assert cover.startswith(b"\xff\xd8")  # JPEG
+        assert result["manifest_path"] == "enc/cid.preview.manifest.json"
+        assert result["cover_path"] == "enc/cid.preview.jpg"
+        assert json.loads((tmp_path / "enc" / "cid.preview.manifest.json").read_text()) == result["manifest"]
+        assert (tmp_path / "enc" / "cid.preview.jpg").read_bytes() == cover
+        # Neither the encrypted package nor the real sidecar: nothing was encrypted.
+        assert sorted(path.name for path in (tmp_path / "enc").iterdir()) == [
+            "cid.preview.jpg",
+            "cid.preview.manifest.json",
+        ]
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_preview_matches_what_the_task_encrypts(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        holder: dict = {}
+        mock_run.side_effect = _capture_package(holder)
+        params = _catalog_task(tmp_path)
+        del params["storage"], params["url"]
+
+        preview = package_preview.run(**params)
+        _call_lcpencrypt(**params)
+
+        assert preview["manifest"] == holder["manifest"]
+        assert base64.b64decode(preview["cover_jpeg_base64"]) == holder["files"]["cid.jpg"]
+        assert preview["manifest_path"] == ""
+
+    def test_preview_without_metadata_warns(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(tmp_path / "book.pdf")
+
+        result = package_preview.run(input_file="book.pdf", contentid="cid", temp=str(tmp_path / "tmp"))
+
+        assert result["success"] is True
+        assert any("no publication metadata" in warning for warning in result["warnings"])
+
+    def test_preview_of_epub_is_refused(self):
+        result = package_preview.run(input_file="book.epub", title="T")
+
+        assert result["success"] is False
+        assert "PDF input only" in result["error"]
+
+    def test_preview_of_a_missing_file_fails_cleanly(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+
+        result = package_preview.run(input_file="missing.pdf", title="T", temp=str(tmp_path / "tmp"))
+
+        assert result["success"] is False
+        assert result["error"].startswith("Package preview failed:")
+        assert list((tmp_path / "tmp").iterdir()) == []

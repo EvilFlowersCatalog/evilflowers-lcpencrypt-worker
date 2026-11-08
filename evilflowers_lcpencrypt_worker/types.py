@@ -43,7 +43,10 @@ class LCPEncryptParams(TypedDict, total=False):
         cover: Cover image, a path relative to STORAGE_PATH or an http(s) URL. Without it the
             first page of the PDF is rendered, as lcpencrypt does.
         lcpsv: License Server to notify, `http://user:pass@host`.
-        notify: CMS notification endpoint, `http://user:pass@host`.
+        notify: CMS notification endpoint, `http://user:pass@host`. lcpencrypt calls it on
+            success only.
+        report: Catalog endpoint the worker POSTs an `EncryptionReport` to after every run,
+            failures included, `http://user:pass@host/path` (Basic auth, like `notify`).
         verbose: Log what is sent to the License Server and the CMS.
         output: (Legacy mode) Temporary location of the encrypted publication, without file name.
         login: (Legacy mode) License Server login.
@@ -62,6 +65,7 @@ class LCPEncryptParams(TypedDict, total=False):
     temp: str
     lcpsv: str
     notify: str
+    report: str
     verbose: bool
 
     # Publication metadata (raw-PDF input)
@@ -115,4 +119,92 @@ class LCPEncryptResult(TypedDict):
     error: str
 
 
-__all__ = ["LCPEncryptParams", "LCPEncryptResult", "StorageMode"]
+class PackageSummary(TypedDict, total=False):
+    """What the worker put into the package and where the result went (`report` of `EncryptionReport`).
+
+    Package keys are present only when the worker built the package (PDF input with metadata);
+    `protected_content_*` only after a successful run.
+
+    Attributes:
+        cover: `catalog` (the catalog's `cover`), `rendered` (page 1) or `none`.
+        pages: Page count (`numberOfPages`).
+        toc_entries: Number of `toc` entries taken from the PDF outline, nested ones included.
+        warnings: Best-effort steps that fell back (unusable catalog cover, unreadable PDF, …).
+        manifest: The manifest sidecar, relative to STORAGE_PATH (`{storage}/{filename}.manifest.json`).
+        protected_content_location: As in `LCPEncryptResult`.
+        protected_content_type: As in `LCPEncryptResult`.
+        protected_content_length: As in `LCPEncryptResult`.
+        protected_content_sha256: As in `LCPEncryptResult`.
+    """
+
+    cover: str
+    pages: int
+    toc_entries: int
+    warnings: list[str]
+    manifest: str
+    protected_content_location: str
+    protected_content_type: str
+    protected_content_length: int
+    protected_content_sha256: str
+
+
+class EncryptionReport(TypedDict):
+    """JSON body the worker POSTs to the `report` URL once per task, whatever the outcome.
+
+    Never carries the content encryption key. The request has a W3C `traceparent` header, so
+    the catalog's handler joins the task's trace.
+
+    Attributes:
+        contentid: The task's `contentid` (empty when the catalog sent none).
+        task_id: Celery task id.
+        trace_id: Trace of the task (lowercase hex), empty without telemetry.
+        success: Whether the publication was encrypted and lcpencrypt did not withdraw it.
+        error: Why not; empty when `success` is True.
+        report: See `PackageSummary`.
+    """
+
+    contentid: str
+    task_id: str
+    trace_id: str
+    success: bool
+    error: str
+    report: PackageSummary
+
+
+class PackagePreviewResult(TypedDict):
+    """Result of `evilflowers_lcpencrypt_worker.package_preview` (nothing is encrypted or registered).
+
+    Attributes:
+        success: Whether the package could be built.
+        error: Why not; empty when `success` is True.
+        manifest: The `manifest.json` the encryption task would hand to lcpencrypt.
+        cover_jpeg_base64: The cover entry of the package, base64; empty without a cover.
+        cover: `catalog`, `rendered` or `none`.
+        pages: Page count.
+        toc_entries: `toc` entries, nested ones included.
+        warnings: Best-effort steps that fell back.
+        manifest_path: Where the preview manifest was written, relative to STORAGE_PATH
+            (`{storage}/{filename}.preview.manifest.json`); empty without filesystem `storage`.
+        cover_path: Where the preview cover was written (`{storage}/{filename}.preview.jpg`), or empty.
+    """
+
+    success: bool
+    error: str
+    manifest: dict[str, object]
+    cover_jpeg_base64: str
+    cover: str
+    pages: int
+    toc_entries: int
+    warnings: list[str]
+    manifest_path: str
+    cover_path: str
+
+
+__all__ = [
+    "EncryptionReport",
+    "LCPEncryptParams",
+    "LCPEncryptResult",
+    "PackagePreviewResult",
+    "PackageSummary",
+    "StorageMode",
+]

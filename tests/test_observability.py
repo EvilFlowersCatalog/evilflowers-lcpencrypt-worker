@@ -126,6 +126,65 @@ class TestTaskSpan:
         assert "lcp.metadata.injection_failed" in [event.name for event in span.events]
 
 
+class TestReportTracing:
+    """Issue #3: the report joins the task's trace; issue #4: the manifest is on the span."""
+
+    @patch("evilflowers_lcpencrypt_worker.report.urllib.request.urlopen")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_report_is_a_client_span_carrying_traceparent(self, mock_run, mock_urlopen, spans, monkeypatch, tmp_path):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+        response = MagicMock(status=200)
+        response.__enter__.return_value = response
+        mock_urlopen.return_value = response
+
+        lcpencrypt.run(input_file="book.epub", contentid="cid-r", report="http://u:p@catalog:8000/hook")
+
+        by_name = {span.name: span for span in spans.get_finished_spans()}
+        task_span, post = by_name["lcpencrypt"], by_name["POST"]
+        assert post.kind is trace.SpanKind.CLIENT
+        assert post.parent.span_id == task_span.context.span_id
+        assert post.attributes["url.full"] == "http://catalog:8000/hook"  # no credentials
+        assert post.attributes["http.response.status_code"] == 200
+        request = mock_urlopen.call_args.args[0]
+        traceparent = request.get_header("Traceparent")
+        trace_hex, span_hex = traceparent.split("-")[1:3]
+        assert trace_hex == trace.format_trace_id(task_span.context.trace_id)
+        assert span_hex == trace.format_span_id(post.context.span_id)
+        body = json.loads(request.data)
+        assert body["trace_id"] == trace_hex
+
+    @patch("evilflowers_lcpencrypt_worker.report.time.sleep")
+    @patch("evilflowers_lcpencrypt_worker.report.urllib.request.urlopen")
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_failed_report_marks_only_its_own_span(self, mock_run, mock_urlopen, _sleep, spans, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", "/mnt/data")
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+        mock_urlopen.side_effect = OSError("refused")
+
+        result = lcpencrypt.run(input_file="book.epub", contentid="cid-f", report="http://catalog/hook")
+
+        assert result["success"] is True
+        by_name = {span.name: span for span in spans.get_finished_spans()}
+        assert by_name["POST"].status.status_code is StatusCode.ERROR
+        assert by_name["POST"].attributes["http.request.resend_count"] == 2
+        assert by_name["lcpencrypt"].status.status_code is StatusCode.UNSET
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_manifest_metadata_event(self, mock_run, spans, monkeypatch, tmp_path):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        (tmp_path / "book.pdf").write_bytes(b"%PDF-1.4")
+        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+
+        lcpencrypt.run(input_file="book.pdf", contentid="cid-m", title="Titul", authors=["A"], temp=str(tmp_path))
+
+        (span,) = spans.get_finished_spans()
+        (event,) = [event for event in span.events if event.name == "lcp.package.manifest"]
+        metadata = json.loads(event.attributes["metadata"])
+        assert metadata["title"] == "Titul"
+        assert metadata["author"] == "A"
+
+
 class TestFailureReason:
     @patch("evilflowers_lcpencrypt_worker.run_executable")
     def test_reason_from_stdout_is_in_error(self, mock_run, spans, monkeypatch):
@@ -154,14 +213,26 @@ class TestFailureReason:
         assert span.attributes["lcp.outcome"] == "failure"
 
     @patch("evilflowers_lcpencrypt_worker.run_executable")
-    def test_stderr_preferred_and_empty_streams_tolerated(self, mock_run, spans, monkeypatch):
+    def test_stdout_preferred_and_empty_streams_tolerated(self, mock_run, spans, monkeypatch):
+        """Real v1.14 output for a missing input: the reason on stdout, Go `log` progress on stderr."""
         monkeypatch.setenv("STORAGE_PATH", "/mnt/data")
         mock_run.side_effect = ExecutableException("lcpencrypt", 2, "", "")
         assert (
             lcpencrypt.run(input_file="b.epub")["error"] == "Encryption failed: lcpencrypt exited with return code 2"
         )
 
-        mock_run.side_effect = ExecutableException("lcpencrypt", 2, "out line", "first\nlast err\n")
+        mock_run.side_effect = ExecutableException(
+            "lcpencrypt",
+            1,
+            "Error processing a publication : open /data/src/missing.epub: no such file or directory\n",
+            "2026/11/08 15:08:29 Process as EPUB\n",
+        )
+        assert lcpencrypt.run(input_file="b.epub")["error"].endswith(
+            ": Error processing a publication : open /data/src/missing.epub: no such file or directory"
+        )
+
+        # Nothing on stdout: stderr is all there is.
+        mock_run.side_effect = ExecutableException("lcpencrypt", 2, "", "first\nlast err\n")
         assert lcpencrypt.run(input_file="b.epub")["error"].endswith(": last err")
 
 

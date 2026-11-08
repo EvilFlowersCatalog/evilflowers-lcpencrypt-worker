@@ -64,6 +64,7 @@ class TestLCPEncryptParams:
             "temp",
             "lcpsv",
             "notify",
+            "report",
             "verbose",
             "output",
             "login",

@@ -30,6 +30,7 @@ Environment Variables:
   BROKER                      Celery broker URL (default: redis://localhost:6379/7)
   STORAGE_PATH                Base path for file storage (default: /mnt/data)
   READIUM_LCPENCRYPT_BIN      Path to lcpencrypt binary (default: lcpencrypt)
+  MANIFEST_SIDECAR            false: no {filename}.manifest.json next to the package (default: true)
   LOG_LEVEL                   Logging level (default: INFO)
   LOG_FORMAT                  json | text (default: text; the container image sets json)
   OTEL_EXPORTER_OTLP_ENDPOINT OTLP/HTTP collector, e.g. http://$(HOST_IP):4318

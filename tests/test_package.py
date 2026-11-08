@@ -17,6 +17,7 @@ from evilflowers_lcpencrypt_worker.package import (
     analyze_pdf,
     build_manifest,
     build_pdf_package,
+    preview_pdf_package,
 )
 from tests.pdf_factory import Bookmark, write_pdf
 
@@ -317,3 +318,35 @@ class TestBuildPdfPackage:
 )
 def test_safe_name(name, expected):
     assert _safe_name(name) == expected
+
+
+class TestPreviewPdfPackage:
+    """Issue #4: the built package, read back."""
+
+    def test_preview_is_the_package_contents(self, tmp_path: Path):
+        pdf = write_pdf(tmp_path / "book.pdf", pages=2, outline=[Bookmark("Only", 1)])
+        metadata = PublicationMetadata(title="T", authors=["A"])
+
+        preview = preview_pdf_package(str(pdf), metadata, cover_name="cid", work_dir=str(tmp_path))
+        build_pdf_package(str(pdf), str(tmp_path / "real.rpf"), metadata, cover_name="cid")
+
+        with zipfile.ZipFile(tmp_path / "real.rpf") as archive:
+            assert preview.manifest == json.loads(archive.read("manifest.json"))
+            assert preview.cover == archive.read("cid.jpg")
+        assert preview.cover_href == "cid.jpg"
+        assert preview.report.manifest == preview.manifest
+        assert (preview.report.cover, preview.report.page_count, preview.report.toc_entries) == ("rendered", 2, 1)
+        # Only the PDF and the real package remain: the preview's temp dir is gone.
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["book.pdf", "real.rpf"]
+
+    def test_unreadable_pdf_still_previews_the_metadata(self, tmp_path: Path):
+        (tmp_path / "bad.pdf").write_bytes(b"not a pdf")
+
+        preview = preview_pdf_package(
+            str(tmp_path / "bad.pdf"), PublicationMetadata(title="T"), work_dir=str(tmp_path)
+        )
+
+        assert preview.manifest["metadata"]["title"] == "T"
+        assert preview.cover is None
+        assert preview.cover_href is None
+        assert preview.report.warnings

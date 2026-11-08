@@ -2,10 +2,13 @@
 
 A Celery worker that encrypts publications with Readium LCP (Licensed Content Protection) by
 wrapping the `lcpencrypt` command-line tool. EvilFlowersCatalog queues the task; lcpencrypt
-registers the content with the License Server and calls the catalog's notify webhook.
+registers the content with the License Server and calls the catalog's notify webhook; the worker
+reports every outcome to the catalog's `report` URL when it gets one.
 """
 
+import base64
 import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -13,6 +16,7 @@ import shutil
 import tempfile
 import time
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Unpack
 
@@ -23,9 +27,22 @@ from opentelemetry.trace import Status, StatusCode
 
 from evilflowers_lcpencrypt_worker import telemetry
 from evilflowers_lcpencrypt_worker.helpers import CliValue, ExecutableException, run_executable
-from evilflowers_lcpencrypt_worker.log_format import configure_logging
-from evilflowers_lcpencrypt_worker.package import PublicationMetadata, build_pdf_package, localize, suffix_of
-from evilflowers_lcpencrypt_worker.types import LCPEncryptParams, LCPEncryptResult, StorageMode
+from evilflowers_lcpencrypt_worker.log_format import configure_logging, current_trace_ids
+from evilflowers_lcpencrypt_worker.package import (
+    PackageReport,
+    PublicationMetadata,
+    build_pdf_package,
+    localize,
+    preview_pdf_package,
+    suffix_of,
+)
+from evilflowers_lcpencrypt_worker.report import encryption_report, send_report
+from evilflowers_lcpencrypt_worker.types import (
+    LCPEncryptParams,
+    LCPEncryptResult,
+    PackagePreviewResult,
+    StorageMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +118,13 @@ _MIME_BY_SUFFIX: Final = {
 # so these are probed after the bare file name when looking for the encrypted file.
 _OUTPUT_EXTENSIONS: Final = (".epub", ".lcpdf", ".lcpa", ".lcpdi", ".webpub", ".pdf", ".lpf", ".audiobook")
 
+# lcpencrypt v1.14 prints this on stdout when the CMS (`-notify`) refuses or misses the call. It
+# then withdraws the content from the License Server again and still exits 0.
+_CMS_NOTIFICATION_ERROR: Final = "Error notifying the CMS"
+
+# Size cap of the manifest metadata recorded as a span event.
+_MANIFEST_EVENT_MAX_CHARS: Final = 4096
+
 
 def _determine_storage_mode(storage: str | None) -> StorageMode:
     """0 (not stored), 1 (S3) or 2 (file system), from the `storage` parameter."""
@@ -150,12 +174,24 @@ def _resolve_local_output(local_file_path: str) -> str | None:
 
 
 def _failure_reason(error: ExecutableException) -> str:
-    """Last non-empty line lcpencrypt printed. It reports parameter errors on stdout, not stderr
-    (e.g. `Parameters : incorrect parameters, storage requires url`)."""
-    for stream in (error.stderr, error.stdout):
+    """Last non-empty line lcpencrypt printed, stdout first.
+
+    lcpencrypt's `exitWithError` prints the reason on stdout (`Parameters : incorrect
+    parameters, storage requires url`, `Error processing a publication : …`); stderr carries Go
+    `log` progress such as `Process as EPUB`, which is no reason.
+    """
+    for stream in (error.stdout, error.stderr):
         lines = [line.strip() for line in (stream or "").splitlines() if line.strip()]
         if lines:
             return lines[-1]
+    return ""
+
+
+def _cms_notification_error(stdout: str) -> str:
+    """lcpencrypt's `Error notifying the CMS: …` line, or empty."""
+    for line in stdout.splitlines():
+        if line.strip().startswith(_CMS_NOTIFICATION_ERROR):
+            return line.strip()
     return ""
 
 
@@ -167,7 +203,28 @@ def _content_key(stdout: str) -> str:
     return ""
 
 
-# -- task -----------------------------------------------------------------------------
+def _sidecar_enabled() -> bool:
+    """`MANIFEST_SIDECAR` (default on): write `{filename}.manifest.json` next to the package."""
+    return os.getenv("MANIFEST_SIDECAR", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _local_storage_dir(storage: str | None, storage_path: str) -> Path | None:
+    """The file-system storage directory, or None for S3 and legacy mode."""
+    if not storage or storage.startswith("s3:"):
+        return None
+    return Path(storage_path) / storage
+
+
+# -- tasks ----------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _Outcome:
+    """What one run produced: the task result plus what the report needs."""
+
+    result: LCPEncryptResult
+    package: PackageReport | None = None
+    manifest_path: str | None = None
 
 
 @app.task(
@@ -191,18 +248,56 @@ def lcpencrypt(
     For raw-PDF input with publication metadata (`title`, `authors`, `publisher`, …), the PDF is
     first wrapped into a Readium package whose manifest carries that metadata plus what
     lcpencrypt would have added itself: a cover, `numberOfPages` and the PDF's outline as `toc`
-    (best effort: on failure the raw PDF is encrypted).
+    (best effort: on failure the raw PDF is encrypted). The manifest is also written next to the
+    package as `{filename}.manifest.json` (file-system storage, `MANIFEST_SIDECAR`).
+
+    With a `report` URL the outcome is POSTed there once, failures included (see `report.py`).
 
     Environment:
         STORAGE_PATH: Base path for file storage (default `/mnt/data`).
         READIUM_LCPENCRYPT_BIN: Path to the lcpencrypt binary (default `lcpencrypt`).
+        MANIFEST_SIDECAR: `false` turns the manifest sidecar off (default on).
 
     Returns:
-        LCPEncryptResult; `success` is False (and `error` set) when lcpencrypt fails.
+        LCPEncryptResult; `success` is False (and `error` set) when lcpencrypt fails or withdraws
+        the publication because the CMS notification failed.
 
     Example:
         >>> lcpencrypt.delay(input_file="book.epub", storage="s3:eu-west-3:lcp", contentid="book-123")
     """
+    input_file = params["input_file"]
+    contentid = params.get("contentid")
+    input_format = _input_format(input_file)
+    log_extra = {"content_id": contentid, "task_id": self.request.id}
+
+    logger.info("Starting LCP encryption for %s", input_file, extra=log_extra)
+
+    tracer = trace.get_tracer(telemetry.INSTRUMENTATION_SCOPE, telemetry.service_version())
+    with tracer.start_as_current_span(
+        "lcpencrypt",
+        attributes={
+            "lcp.content_id": contentid or "",
+            "lcp.input.format": input_format,
+            "lcp.storage_mode": _determine_storage_mode(params.get("storage")),
+            "lcp.metadata.injected": False,
+        },
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        try:
+            outcome = _encrypt(params, log_extra=log_extra, span=span)
+        except Exception as error:
+            # A bug, not an lcpencrypt failure: still tell the catalog, then let Celery see it.
+            span.record_exception(error)
+            span.set_status(Status(StatusCode.ERROR, type(error).__name__))
+            _report(params, self.request.id, _Outcome(_failed(params, f"Worker error: {error!r}")))
+            raise
+        _report(params, self.request.id, outcome)
+        return outcome.result
+
+
+def _encrypt(params: LCPEncryptParams, *, log_extra: dict[str, Any], span: trace.Span) -> _Outcome:
+    """Run lcpencrypt for one task; every return is an outcome the catalog can be told about."""
     input_file = params["input_file"]
     storage = params.get("storage")
     url = params.get("url")
@@ -214,12 +309,15 @@ def lcpencrypt(
     storage_path = os.getenv("STORAGE_PATH", "/mnt/data")
     lcpencrypt_bin = os.getenv("READIUM_LCPENCRYPT_BIN", "lcpencrypt")
     input_format = _input_format(input_file)
-    log_extra = {"content_id": contentid, "task_id": self.request.id}
 
-    logger.info("Starting LCP encryption for %s", input_file, extra=log_extra)
+    if storage and not url:
+        # lcpencrypt (v1.13.4+) exits with "storage requires url"; say so without running it.
+        _record(span, input_format, "failure", 0.0)
+        span.set_status(Status(StatusCode.ERROR, "storage requires url"))
+        logger.error("LCP encryption refused for %s: storage requires url", input_file, extra=log_extra)
+        return _Outcome(_failed(params, "Invalid parameters: storage requires url"))
 
     resolved_input = _resolve(input_file, storage_path)
-
     cmd_args: dict[str, CliValue] = {
         "input": resolved_input,
         "contentid": contentid,
@@ -245,85 +343,81 @@ def lcpencrypt(
     }
     cmd_args |= {key: value for key, value in optional.items() if value}
 
-    tracer = trace.get_tracer(telemetry.INSTRUMENTATION_SCOPE, telemetry.service_version())
-    with tracer.start_as_current_span(
-        "lcpencrypt",
-        attributes={
-            "lcp.content_id": contentid or "",
-            "lcp.input.format": input_format,
-            "lcp.storage_mode": _determine_storage_mode(storage),
-            "lcp.metadata.injected": False,
-        },
-        record_exception=False,
-        set_status_on_exception=False,
-    ) as span:
-        if storage and not url:
-            # lcpencrypt (v1.13.4+) exits with "storage requires url"; say so without running it.
-            _record(span, input_format, "failure", 0.0)
-            span.set_status(Status(StatusCode.ERROR, "storage requires url"))
-            logger.error("LCP encryption refused for %s: storage requires url", input_file, extra=log_extra)
-            return _failed(contentid, storage, input_file, "Invalid parameters: storage requires url")
-
-        package_temp_dir = _prepackage_pdf(
-            cmd_args,
-            resolved_input,
-            temp,
-            PublicationMetadata.from_params(params),
-            cover=_resolve(cover, storage_path) if (cover := params.get("cover")) else None,
-            # lcpencrypt names the stored cover after this entry, as its own PDF path does.
-            cover_name=filename or contentid or "cover",
-            span=span,
+    package_temp_dir, package = _prepackage_pdf(
+        cmd_args,
+        resolved_input,
+        temp,
+        PublicationMetadata.from_params(params),
+        cover=_resolve(cover, storage_path) if (cover := params.get("cover")) else None,
+        # lcpencrypt names the stored cover after this entry, as its own PDF path does.
+        cover_name=filename or contentid or "cover",
+        span=span,
+    )
+    started = time.perf_counter()
+    try:
+        result = run_executable(executable_path=lcpencrypt_bin, kwargs_dict=cmd_args, kwargs_key_prefix="-")
+    except ExecutableException as error:
+        _record(span, input_format, "failure", time.perf_counter() - started)
+        span.set_attribute("process.exit.code", error.returncode)
+        span.record_exception(error)
+        span.set_status(Status(StatusCode.ERROR, f"lcpencrypt exited with {error.returncode}"))
+        # `error`, not `exception`: a Python traceback adds nothing to lcpencrypt's own stderr.
+        logger.error(
+            "LCP encryption failed for %s: %s",
+            input_file,
+            error,
+            extra={**log_extra, "returncode": error.returncode, "stderr": error.stderr, "stdout": error.stdout},
         )
-        started = time.perf_counter()
-        try:
-            result = run_executable(executable_path=lcpencrypt_bin, kwargs_dict=cmd_args, kwargs_key_prefix="-")
-        except ExecutableException as error:
-            _record(span, input_format, "failure", time.perf_counter() - started)
-            span.set_attribute("process.exit.code", error.returncode)
-            span.record_exception(error)
-            span.set_status(Status(StatusCode.ERROR, f"lcpencrypt exited with {error.returncode}"))
-            # `error`, not `exception`: a Python traceback adds nothing to lcpencrypt's own stderr.
-            logger.error(
-                "LCP encryption failed for %s: %s",
-                input_file,
-                error,
-                extra={**log_extra, "returncode": error.returncode, "stderr": error.stderr, "stdout": error.stdout},
-            )
-            reason = _failure_reason(error)
-            return _failed(
-                contentid, storage, input_file, f"Encryption failed: {error}" + (f": {reason}" if reason else "")
-            )
-        finally:
-            # Remove the temporary Readium package (and any downloaded PDF next to it).
-            if package_temp_dir is not None:
-                shutil.rmtree(package_temp_dir, ignore_errors=True)
+        reason = _failure_reason(error)
+        message = f"Encryption failed: {error}" + (f": {reason}" if reason else "")
+        return _Outcome(_failed(params, message), package)
+    finally:
+        # Remove the temporary Readium package (and any downloaded PDF next to it).
+        if package_temp_dir is not None:
+            shutil.rmtree(package_temp_dir, ignore_errors=True)
 
-        _record(span, input_format, "success", time.perf_counter() - started)
-        span.set_attribute("process.exit.code", result.returncode)
-        logger.info("LCP encryption completed for %s", input_file, extra=log_extra)
-        logger.debug("lcpencrypt output: %s", result.stdout)
+    span.set_attribute("process.exit.code", result.returncode)
+    if cms_error := _cms_notification_error(result.stdout):
+        # Exit 0, yet lcpencrypt took the content back off the License Server: not lendable.
+        _record(span, input_format, "failure", time.perf_counter() - started)
+        span.set_status(Status(StatusCode.ERROR, "CMS notification failed"))
+        logger.error(
+            "LCP encryption of %s withdrawn: %s",
+            input_file,
+            cms_error,
+            extra={**log_extra, "stdout": result.stdout},
+        )
+        message = f"Encryption withdrawn from the License Server: {cms_error}"
+        return _Outcome(_failed(params, message), package)
 
-        output_filename = filename or contentid or Path(input_file).stem
-        match storage:
-            case str() if storage.startswith("s3:"):
-                output_location = f"{url}/{output_filename}"
-                local_file_path = None
-            case str() if storage:
-                local_file_path = str(Path(storage_path) / storage / output_filename)
-                output_location = f"{url}/{output_filename}"
-            case _:
-                local_file_path = str(Path(output or temp) / output_filename)
-                output_location = local_file_path
+    _record(span, input_format, "success", time.perf_counter() - started)
+    logger.info("LCP encryption completed for %s", input_file, extra=log_extra)
+    logger.debug("lcpencrypt output: %s", result.stdout)
 
-        mime_type, file_size, file_hash = "application/octet-stream", 0, ""
-        if local_file_path is not None and (found := _resolve_local_output(local_file_path)) is not None:
-            # `found` is `local_file_path` plus the extension lcpencrypt appended (`.lcpdf`, `.epub`, …).
-            output_location += found.removeprefix(local_file_path)
-            mime_type, file_size, file_hash = _get_file_info(found)
-            telemetry.protected_content_size().record(file_size, {"lcp.input.format": input_format})
-            span.set_attribute("lcp.protected_content.size", file_size)
+    output_filename = filename or contentid or Path(input_file).stem
+    match storage:
+        case str() if storage.startswith("s3:"):
+            output_location = f"{url}/{output_filename}"
+            local_file_path = None
+        case str() if storage:
+            local_file_path = str(Path(storage_path) / storage / output_filename)
+            output_location = f"{url}/{output_filename}"
+        case _:
+            local_file_path = str(Path(output or temp) / output_filename)
+            output_location = local_file_path
 
-        return LCPEncryptResult(
+    mime_type, file_size, file_hash = "application/octet-stream", 0, ""
+    if local_file_path is not None and (found := _resolve_local_output(local_file_path)) is not None:
+        # `found` is `local_file_path` plus the extension lcpencrypt appended (`.lcpdf`, `.epub`, …).
+        output_location += found.removeprefix(local_file_path)
+        mime_type, file_size, file_hash = _get_file_info(found)
+        telemetry.protected_content_size().record(file_size, {"lcp.input.format": input_format})
+        span.set_attribute("lcp.protected_content.size", file_size)
+
+    manifest_path = _write_manifest_sidecar(package, storage, storage_path, output_filename, span)
+
+    return _Outcome(
+        LCPEncryptResult(
             content_id=contentid or "generated",
             content_encryption_key=_content_key(result.stdout),
             storage_mode=_determine_storage_mode(storage),
@@ -334,7 +428,10 @@ def lcpencrypt(
             protected_content_sha256=file_hash,
             success=True,
             error="",
-        )
+        ),
+        package,
+        manifest_path,
+    )
 
 
 def _prepackage_pdf(
@@ -346,29 +443,25 @@ def _prepackage_pdf(
     cover: str | None,
     cover_name: str,
     span: trace.Span,
-) -> str | None:
-    """Swap a raw PDF input for a Readium package carrying the metadata; returns its temp dir.
+) -> tuple[str | None, PackageReport | None]:
+    """Swap a raw PDF input for a Readium package carrying the metadata.
+
+    Returns `(temp dir, report)`: the caller removes the temp dir after lcpencrypt ran; the
+    report is None when nothing was packaged.
 
     lcpencrypt has no metadata flags, so for raw-PDF input with metadata the PDF is wrapped in a
     `.rpf` whose manifest lcpencrypt keeps. Best effort: on any failure the raw PDF is encrypted
     without the metadata rather than failing the task. Downloads (remote PDF or cover) live in
-    the package's temp dir, which the caller removes after lcpencrypt ran.
+    the package's temp dir.
     """
     if metadata.is_empty() or not _looks_like_pdf(resolved_input):
-        return None
+        return None, None
 
     package_temp_dir: str | None = None
     try:
         os.makedirs(temp, exist_ok=True)
         package_temp_dir = tempfile.mkdtemp(prefix="lcp-rwpp-", dir=temp)
-        local_pdf, _ = localize(resolved_input, package_temp_dir, ".pdf")
-        local_cover: str | None = None
-        if cover is not None:
-            try:
-                local_cover, _ = localize(cover, package_temp_dir, suffix_of(cover) or ".img")
-            except Exception as error:  # noqa: BLE001 - the first page is rendered instead
-                logger.warning("Could not fetch the catalog cover %s: %s", cover, error)
-
+        local_pdf, local_cover = _localize_inputs(resolved_input, cover, package_temp_dir)
         package_path = str(Path(package_temp_dir) / f"{Path(resolved_input.split('?')[0]).stem or 'book'}.rpf")
         report = build_pdf_package(local_pdf, package_path, metadata, cover_source=local_cover, cover_name=cover_name)
         cmd_args["input"] = package_path
@@ -382,6 +475,9 @@ def _prepackage_pdf(
         )
         for warning in report.warnings:
             span.add_event("lcp.package.warning", {"message": warning})
+        # What the reading app will show, in Tempo: the metadata block (no toc), size-capped.
+        metadata_json = json.dumps(report.manifest.get("metadata", {}), ensure_ascii=False)
+        span.add_event("lcp.package.manifest", {"metadata": metadata_json[:_MANIFEST_EVENT_MAX_CHARS]})
         logger.info(
             "Pre-packaged PDF into a Readium package: title=%r authors=%r cover=%s pages=%d toc=%d",
             metadata.title,
@@ -390,19 +486,194 @@ def _prepackage_pdf(
             report.page_count,
             report.toc_entries,
         )
+        return package_temp_dir, report
     except Exception as error:  # noqa: BLE001 - metadata injection is best effort
         logger.warning("Failed to pre-package PDF with metadata, encrypting the raw input: %s", error)
         span.add_event("lcp.metadata.injection_failed", {"exception.message": str(error)})
-    return package_temp_dir
+        return package_temp_dir, None
 
 
-def _failed(contentid: str | None, storage: str | None, input_file: str, error: str) -> LCPEncryptResult:
+def _localize_inputs(resolved_input: str, cover: str | None, temp_dir: str) -> tuple[str, str | None]:
+    """Local copies of a remote PDF and cover; an unreachable cover is dropped (page 1 is rendered)."""
+    local_pdf, _ = localize(resolved_input, temp_dir, ".pdf")
+    local_cover: str | None = None
+    if cover is not None:
+        try:
+            local_cover, _ = localize(cover, temp_dir, suffix_of(cover) or ".img")
+        except Exception as error:  # noqa: BLE001 - the first page is rendered instead
+            logger.warning("Could not fetch the catalog cover %s: %s", cover, error)
+    return local_pdf, local_cover
+
+
+def _write_manifest_sidecar(
+    package: PackageReport | None,
+    storage: str | None,
+    storage_path: str,
+    output_filename: str,
+    span: trace.Span,
+) -> str | None:
+    """`{storage}/{filename}.manifest.json`: the package's (unencrypted) manifest, for inspection.
+
+    No content and no keys, only metadata, reading order, toc and resources. Returns its path
+    relative to STORAGE_PATH, or None when there is nothing to write or nowhere to write it.
+    A failed write is a warning: the publication itself is fine.
+    """
+    directory = _local_storage_dir(storage, storage_path)
+    if package is None or not package.manifest or directory is None or not _sidecar_enabled():
+        return None
+    name = f"{output_filename}.manifest.json"
+    try:
+        (directory / name).write_text(json.dumps(package.manifest, ensure_ascii=False, indent=2) + "\n")
+    except OSError as error:
+        logger.warning("Could not write the manifest sidecar %s: %s", directory / name, error)
+        span.add_event("lcp.package.sidecar_failed", {"exception.message": str(error)})
+        return None
+    relative = f"{storage}/{name}"
+    span.set_attribute("lcp.package.manifest_path", relative)
+    return relative
+
+
+def _report(params: LCPEncryptParams, task_id: str | None, outcome: _Outcome) -> None:
+    """POST the outcome to the catalog's `report` URL, when the task got one.
+
+    Whatever goes wrong here is logged and swallowed: the task's own result (or the exception
+    it is about to re-raise) must never be replaced by a reporting problem.
+    """
+    if not (url := params.get("report")):
+        return
+    try:
+        trace_id, _ = current_trace_ids()
+        payload = encryption_report(
+            outcome.result,
+            contentid=params.get("contentid"),
+            task_id=task_id,
+            trace_id=trace_id,
+            package=outcome.package,
+            manifest_path=outcome.manifest_path,
+        )
+        send_report(url, payload)
+    except Exception as error:  # noqa: BLE001 - a report must not change the task's outcome
+        logger.warning("Reporting the task outcome failed: %r", error, extra={"task_id": task_id})
+
+
+@app.task(bind=True, name="evilflowers_lcpencrypt_worker.package_preview", queue=QUEUE)
+def package_preview(
+    self: "Task[Any, PackagePreviewResult]",  # noqa: UP037 - must not be evaluated at runtime, see lcpencrypt
+    **params: Unpack[LCPEncryptParams],
+) -> PackagePreviewResult:
+    """Build the package `lcpencrypt` would get for a raw PDF, without encrypting anything.
+
+    Takes the encryption task's parameters. Nothing reaches lcpencrypt, the License Server or
+    `notify`. The result carries the manifest and the cover; with file-system `storage` both are
+    also written there (`{filename}.preview.manifest.json`, `{filename}.preview.jpg`), since the
+    catalog runs without a result backend.
+    """
+    input_file = params["input_file"]
+    contentid = params.get("contentid")
+    filename = params.get("filename") or contentid or Path(input_file).stem
+    storage_path = os.getenv("STORAGE_PATH", "/mnt/data")
+    temp = params.get("temp", "/tmp")  # noqa: S108 - as in lcpencrypt
+    resolved_input = _resolve(input_file, storage_path)
+    log_extra = {"content_id": contentid, "task_id": self.request.id}
+
+    if not _looks_like_pdf(resolved_input):
+        return _preview_failed("package preview supports PDF input only (EPUB carries its own metadata)")
+
+    tracer = trace.get_tracer(telemetry.INSTRUMENTATION_SCOPE, telemetry.service_version())
+    with tracer.start_as_current_span(
+        "lcpencrypt.package_preview",
+        attributes={"lcp.content_id": contentid or "", "lcp.input.format": "pdf"},
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
+        metadata = PublicationMetadata.from_params(params)
+        cover = _resolve(cover_param, storage_path) if (cover_param := params.get("cover")) else None
+        try:
+            os.makedirs(temp, exist_ok=True)
+            temp_dir = tempfile.mkdtemp(prefix="lcp-preview-", dir=temp)
+            try:
+                local_pdf, local_cover = _localize_inputs(resolved_input, cover, temp_dir)
+                preview = preview_pdf_package(
+                    local_pdf, metadata, cover_source=local_cover, cover_name=filename, work_dir=temp_dir
+                )
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as error:  # noqa: BLE001 - a preview reports, it does not crash the worker
+            span.record_exception(error)
+            span.set_status(Status(StatusCode.ERROR, type(error).__name__))
+            logger.warning("Package preview failed for %s: %s", input_file, error, extra=log_extra)
+            return _preview_failed(f"Package preview failed: {error}")
+
+        report = preview.report
+        warnings = list(report.warnings)
+        if metadata.is_empty():
+            warnings.append("no publication metadata: the encryption task lets lcpencrypt package this PDF itself")
+
+        manifest_path, cover_path = "", ""
+        if (directory := _local_storage_dir(params.get("storage"), storage_path)) is not None:
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                manifest_name = f"{filename}.preview.manifest.json"
+                (directory / manifest_name).write_text(json.dumps(preview.manifest, ensure_ascii=False, indent=2))
+                manifest_path = f"{params.get('storage')}/{manifest_name}"
+                if preview.cover is not None:
+                    cover_name = f"{filename}.preview.jpg"
+                    (directory / cover_name).write_bytes(preview.cover)
+                    cover_path = f"{params.get('storage')}/{cover_name}"
+            except OSError as error:
+                warnings.append(f"could not write the preview to storage: {error}")
+
+        span.set_attributes(
+            {
+                "lcp.package.cover": report.cover,
+                "lcp.package.pages": report.page_count,
+                "lcp.package.toc_entries": report.toc_entries,
+            }
+        )
+        logger.info(
+            "Package preview for %s: cover=%s pages=%d toc=%d",
+            input_file,
+            report.cover,
+            report.page_count,
+            report.toc_entries,
+            extra=log_extra,
+        )
+        return PackagePreviewResult(
+            success=True,
+            error="",
+            manifest=preview.manifest,
+            cover_jpeg_base64=base64.b64encode(preview.cover).decode() if preview.cover is not None else "",
+            cover=report.cover,
+            pages=report.page_count,
+            toc_entries=report.toc_entries,
+            warnings=warnings,
+            manifest_path=manifest_path,
+            cover_path=cover_path,
+        )
+
+
+def _preview_failed(error: str) -> PackagePreviewResult:
+    return PackagePreviewResult(
+        success=False,
+        error=error,
+        manifest={},
+        cover_jpeg_base64="",
+        cover="none",
+        pages=0,
+        toc_entries=0,
+        warnings=[],
+        manifest_path="",
+        cover_path="",
+    )
+
+
+def _failed(params: LCPEncryptParams, error: str) -> LCPEncryptResult:
     return LCPEncryptResult(
-        content_id=contentid or "unknown",
+        content_id=params.get("contentid") or "unknown",
         content_encryption_key="",
-        storage_mode=_determine_storage_mode(storage),
+        storage_mode=_determine_storage_mode(params.get("storage")),
         protected_content_location="",
-        protected_content_disposition=Path(input_file).name,
+        protected_content_disposition=Path(params["input_file"]).name,
         protected_content_type="",
         protected_content_length=0,
         protected_content_sha256="",
@@ -418,4 +689,4 @@ def _record(span: trace.Span, input_format: str, outcome: str, seconds: float) -
     span.set_attribute("lcp.outcome", outcome)
 
 
-__all__ = ["LCPEncryptParams", "LCPEncryptResult", "app", "lcpencrypt"]
+__all__ = ["LCPEncryptParams", "LCPEncryptResult", "PackagePreviewResult", "app", "lcpencrypt", "package_preview"]

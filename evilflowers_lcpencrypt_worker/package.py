@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 import urllib.parse
 import urllib.request
@@ -131,12 +132,23 @@ class PdfInfo:
 
 @dataclass(slots=True)
 class PackageReport:
-    """What went into the package; recorded on the task span."""
+    """What went into the package; recorded on the task span and sent in the task report."""
 
     cover: str = "none"  # "catalog", "rendered" or "none"
     page_count: int = 0
     toc_entries: int = 0
     warnings: list[str] = field(default_factory=list)
+    manifest: dict[str, Any] = field(default_factory=dict)  # as written into the package
+
+
+@dataclass(slots=True)
+class PackagePreview:
+    """A built package, unpacked: what a reading app will show (issue #4)."""
+
+    manifest: dict[str, Any]
+    cover: bytes | None
+    cover_href: str | None
+    report: PackageReport
 
 
 # -- PDF inspection -------------------------------------------------------------------------
@@ -333,6 +345,7 @@ def build_pdf_package(
         write_package(pdf_path, package_path, manifest, (cover_file, href) if cover_file and href else None)
         report.page_count = info.page_count
         report.toc_entries = _count(info.toc)
+        report.manifest = manifest
         return report
     finally:
         for leftover in (rendered_cover, catalog_cover):
@@ -340,6 +353,40 @@ def build_pdf_package(
                 os.remove(leftover)
         with contextlib.suppress(OSError):
             os.rmdir(work_dir)
+
+
+def preview_pdf_package(
+    pdf_path: str,
+    metadata: PublicationMetadata,
+    *,
+    cover_source: str | None = None,
+    cover_name: str = "cover",
+    work_dir: str | None = None,
+) -> PackagePreview:
+    """Build the package exactly as the encryption task does, then read it back.
+
+    Shared by the `package_preview` task and the command line, so both show what lcpencrypt
+    would receive. The package itself is built in a temp dir under `work_dir` and removed.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="lcp-preview-", dir=work_dir)
+    try:
+        package_path = str(Path(temp_dir) / "preview.rpf")
+        report = build_pdf_package(pdf_path, package_path, metadata, cover_source=cover_source, cover_name=cover_name)
+        with zipfile.ZipFile(package_path) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            href = cover_href(manifest)
+            cover = archive.read(href) if href is not None else None
+        return PackagePreview(manifest=manifest, cover=cover, cover_href=href, report=report)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def cover_href(manifest: dict[str, Any]) -> str | None:
+    """The `href` of the manifest's `cover` resource, if any."""
+    for resource in manifest.get("resources", []):
+        if "cover" in resource.get("rel", []):
+            return str(resource["href"])
+    return None
 
 
 # -- input locators -------------------------------------------------------------------------
@@ -430,6 +477,7 @@ def _count(entries: list[TocEntry]) -> int:
 
 
 __all__ = [
+    "PackagePreview",
     "PackageReport",
     "PdfInfo",
     "PublicationMetadata",
@@ -437,6 +485,8 @@ __all__ = [
     "analyze_pdf",
     "build_manifest",
     "build_pdf_package",
+    "cover_href",
     "localize",
+    "preview_pdf_package",
     "suffix_of",
 ]

@@ -178,7 +178,8 @@ Use these for modern deployments with custom storage:
 |-----------|------|---------|-------------------------------------------------------------|
 | `temp`    | str  | `/tmp`  | Working directory for temporary files                       |
 | `lcpsv`   | str  | -       | License server endpoint (format: `http://user:pass@host`)   |
-| `notify`  | str  | -       | CMS notification endpoint (format: `http://user:pass@host`) |
+| `notify`  | str  | -       | CMS notification endpoint (format: `http://user:pass@host`); lcpencrypt calls it on success only |
+| `report`  | str  | -       | Catalog endpoint the worker POSTs every outcome to, failures included (`http://user:pass@host/path`); see [Outcome report](#outcome-report) |
 | `verbose` | bool | `False` | Enable verbose logging                                      |
 
 ### Publication Metadata (raw-PDF input)
@@ -251,6 +252,61 @@ The task returns an `LCPEncryptResult` TypedDict:
 }
 ```
 
+`success` is also False when lcpencrypt exits 0 after a failed `notify` call: v1.14 then prints
+`Error notifying the CMS: …` and withdraws the content from the License Server again, so the
+publication is not lendable.
+
+### Outcome report
+
+The catalog has no Celery result backend and lcpencrypt calls `notify` only on success, so a
+failed run used to leave the catalog's job `pending` forever. With a `report` URL the worker
+POSTs an `EncryptionReport` there once per task, whatever the outcome (a worker exception
+included, which is then re-raised):
+
+```
+POST {report}
+Authorization: Basic …          (from the URL's user:pass, like -notify)
+traceparent: 00-<trace>-<span>-01
+Content-Type: application/json
+
+{"contentid": "…", "task_id": "…", "trace_id": "…", "success": false, "error": "…",
+ "report": {"cover": "rendered", "pages": 237, "toc_entries": 136, "warnings": [],
+            "manifest": "catalogs/…/encrypted/<filename>.manifest.json",
+            "protected_content_location": "…", "protected_content_type": "…",
+            "protected_content_length": 2150917, "protected_content_sha256": "…"}}
+```
+
+`report` keys appear only when they apply: package keys when the worker built the package,
+`protected_content_*` after a success. The content encryption key is never sent. Transient
+failures (network, 5xx, 408/425/429) are retried 3 times with backoff; any other 4xx is final.
+A report that cannot be delivered is a warning on the `POST` span and in the log, never a change
+of the task result. The request is a client span under `lcpencrypt`, so the catalog's handler
+continues the task's trace.
+
+### Inspecting the package
+
+What a reading app will show can be checked without borrowing the publication:
+
+- **Manifest sidecar**: after a successful run with file-system `storage`, the manifest the
+  worker built is written next to the package as `{storage}/{filename}.manifest.json` (metadata,
+  reading order, toc, resources; no content, no keys). Only when the worker built the package
+  (PDF input with metadata). `MANIFEST_SIDECAR=false` turns it off.
+- **Span event**: `lcp.package.manifest` on the `lcpencrypt` span carries the metadata block
+  (size-capped).
+- **`evilflowers_lcpencrypt_worker.package_preview` task**: same parameters as `lcpencrypt`, builds
+  the package and returns `PackagePreviewResult` (`manifest`, `cover_jpeg_base64`, `cover`, `pages`,
+  `toc_entries`, `warnings`) without calling lcpencrypt, the License Server, `notify` or `report`.
+  With file-system `storage` it also writes `{filename}.preview.manifest.json` and
+  `{filename}.preview.jpg` there (the catalog has no result backend to read a return value from).
+- **Command line**, same builder:
+
+  ```bash
+  python -m evilflowers_lcpencrypt_worker.preview book.pdf --title "Logika" --author "Ada Lovelace" \
+      --author "Alan Turing" --language sk --name <contentid> --out preview/ [--package]
+  ```
+
+  prints the manifest and writes `manifest.json` and the cover (`--package`: also the `.rpf`).
+
 ## Environment Variables
 
 | Variable                      | Description                                        | Default                    | Example                                   |
@@ -260,6 +316,7 @@ The task returns an `LCPEncryptResult` TypedDict:
 | `LOG_FORMAT`                  | `json` (one object per line) or `text`             | `text` (image: `json`)     | `json`                                    |
 | `STORAGE_PATH`                | Base path for file storage                         | `/mnt/data`                | `/var/local/evilflowers`                  |
 | `READIUM_LCPENCRYPT_BIN`      | Path to `lcpencrypt` binary                        | `lcpencrypt`               | `/usr/local/bin/lcpencrypt`               |
+| `MANIFEST_SIDECAR`            | Write `{filename}.manifest.json` next to the package | `true`                   | `false`                                   |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector                                | discovered (see below)     | `http://$(HOST_IP):4318`                  |
 | `HOST_IP`                     | Node IP (k8s downward API), probed on `:4318`      | -                          | `status.hostIP`                           |
 | `OTEL_SERVICE_NAME`           | `service.name` in traces/metrics                   | `lcpencrypt`               | `lcpencrypt`                              |
@@ -280,14 +337,18 @@ The SDK is the `observability` extra (installed in the image); without it every 
 - **Traces**: `CeleryInstrumentor` continues the catalog's trace from the task headers:
   `catalog → apply_async (producer) → run (consumer) → lcpencrypt`. The `lcpencrypt` span carries
   `lcp.content_id`, `lcp.input.format`, `lcp.storage_mode`, `lcp.metadata.injected`, `lcp.outcome`,
-  `process.exit.code`, `lcp.protected_content.size`; a failed run sets status `ERROR`.
+  `process.exit.code`, `lcp.protected_content.size`; for a built PDF package also
+  `lcp.package.cover|pages|toc_entries|manifest_path` and the `lcp.package.manifest` event. A failed
+  run (or a publication lcpencrypt withdrew after a failed `notify`) sets status `ERROR`. The
+  outcome report is a child `POST` client span whose `traceparent` the catalog continues.
+  `package_preview` runs as span `lcpencrypt.package_preview`.
   The broker's Redis traffic is deliberately not traced (it would be one orphan root span per poll).
 - **Metrics**: `lcpencrypt.encryption.duration` (s, histogram), `lcpencrypt.encryptions` (counter),
   `lcpencrypt.protected_content.size` (By), all by `lcp.input.format` / `lcp.outcome`; plus
   per-process `process.*` (CPU, memory, threads, fds) to tell prefork children apart.
 - **Logs**: not exported over OTLP. Alloy tails stdout; with `LOG_FORMAT=json` every line has
   `level`, `logger`, `msg`, and inside a task `trace_id`/`span_id`, `content_id`, `task_id`.
-  URL credentials (`-lcpsv`, `-notify`) are redacted from logged commands.
+  URL credentials (`-lcpsv`, `-notify`, `report`) are redacted from every log line.
 - **Process model**: the collector is discovered once in the main process (`worker_init`), the SDK
   is set up in each prefork child (`worker_process_init`) and flushed on `worker_process_shutdown`.
 
@@ -394,12 +455,14 @@ Note: lcpencrypt requires `url` whenever `storage` is given (`storage requires u
 
 ```
 evilflowers_lcpencrypt_worker/
-├── __init__.py          # Celery app, signal wiring, the lcpencrypt task
+├── __init__.py          # Celery app, signal wiring, the lcpencrypt and package_preview tasks
 ├── __main__.py          # CLI entry point for starting worker
 ├── telemetry.py         # OpenTelemetry setup (collector discovery, providers, instruments)
 ├── log_format.py        # JSON / text log formatting with trace ids
 ├── types.py             # TypedDict wire contract with the catalog
 ├── package.py           # Readium package for raw PDFs: metadata, cover, page count, toc
+├── preview.py           # python -m …preview: the package for a PDF, without encrypting
+├── report.py            # Outcome report POSTed to the catalog (traceparent, retries)
 └── helpers.py           # Executable runner utilities
 ```
 
@@ -407,7 +470,9 @@ evilflowers_lcpencrypt_worker/
 
 The worker provides comprehensive error handling:
 
-- Returns `success: False` with error details if encryption fails
+- Returns `success: False` with error details if encryption fails; `error` ends with
+  lcpencrypt's own reason (its last stdout line, e.g. `Error processing a publication : open …`)
+- Reports every outcome to the catalog's `report` URL when given
 - Logs detailed error information including stdout/stderr
 - Raises `ExecutableException` with structured error data
 - Supports Celery task retry mechanisms
