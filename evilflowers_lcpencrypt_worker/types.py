@@ -18,14 +18,30 @@ class LCPEncryptParams(TypedDict, total=False):
         input_file: Source file (required): a path relative to STORAGE_PATH, or an http(s) URL.
         storage: Target location of the encrypted publication: an S3 bucket (`s3:region:bucket`)
             or a file system path relative to STORAGE_PATH. Omitted = legacy output mode.
-        url: Public base URL that corresponds to `storage`.
+        url: Public base URL that corresponds to `storage`. Required with `storage`
+            (lcpencrypt refuses `storage` without it).
         contentid: Unique identifier of the encrypted publication (lcpencrypt generates a UUID
             when omitted).
         filename: File name of the encrypted publication, without extension (defaults to contentid).
-        title: Publication title. For raw-PDF input it is injected into the Readium package
-            manifest so reading apps (e.g. Thorium) display it. Ignored for EPUB (OPF wins).
-        author: Publication author, injected like `title`. Ignored for EPUB.
         temp: Working folder for temporary files (default `/tmp`).
+
+    Publication metadata (raw-PDF input only; EPUB carries its own OPF metadata). When any of
+    these is given, the PDF is wrapped into a Readium package whose manifest carries them, so
+    reading apps (Thorium, …) display them. Empty values are ignored.
+        title: Title.
+        subtitle: Subtitle.
+        author: One author (kept for catalogs that send a single name).
+        authors: All authors, in order; wins over `author`.
+        translators, editors, illustrators, contributors: Further contributors by role.
+        publisher: Publisher name.
+        language: BCP 47 language code(s), e.g. `sk` or `["sk", "en"]`.
+        published: Publication date, full `YYYY-MM-DD` (a partial `2023` or `2023-05` is
+            dropped: lcpencrypt cannot parse it).
+        description: Summary.
+        subjects: Subject headings / categories.
+        identifier: Publication identifier, preferably a URI (`urn:isbn:…`, `https://doi.org/…`).
+        cover: Cover image, a path relative to STORAGE_PATH or an http(s) URL. Without it the
+            first page of the PDF is rendered, as lcpencrypt does.
         lcpsv: License Server to notify, `http://user:pass@host`.
         notify: CMS notification endpoint, `http://user:pass@host`.
         verbose: Log what is sent to the License Server and the CMS.
@@ -43,12 +59,27 @@ class LCPEncryptParams(TypedDict, total=False):
     # Optional
     contentid: str
     filename: str
-    title: str
-    author: str
     temp: str
     lcpsv: str
     notify: str
     verbose: bool
+
+    # Publication metadata (raw-PDF input)
+    title: str
+    subtitle: str
+    author: str
+    authors: list[str]
+    translators: list[str]
+    editors: list[str]
+    illustrators: list[str]
+    contributors: list[str]
+    publisher: str
+    language: str | list[str]
+    published: str
+    description: str
+    subjects: list[str]
+    identifier: str
+    cover: str
 
     # Legacy mode
     output: str

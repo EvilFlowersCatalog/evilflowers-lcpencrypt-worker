@@ -11,6 +11,8 @@ dependencies = [
     # from the `observability` extra every call is a no-op. Same release train as the catalog
     # (EvilFlowersCatalog IP-019): API/SDK/exporter 1.x and contrib 0.yb0 move together.
     "opentelemetry-api (==1.45.2)",
+    "pypdfium2 (>=5,<6)",
+    "pillow (>=12,<13)",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +73,11 @@ files = ["evilflowers_lcpencrypt_worker"]
 [[tool.mypy.overrides]]
 # Optional SDK packages ship without py.typed markers in places; the API is typed.
 module = ["opentelemetry.instrumentation.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# pypdfium2 has no py.typed marker; package.py treats its objects as Any.
+module = ["pypdfium2", "pypdfium2.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

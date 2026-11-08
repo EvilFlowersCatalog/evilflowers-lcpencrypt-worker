@@ -6,7 +6,6 @@ registers the content with the License Server and calls the catalog's notify web
 """
 
 import hashlib
-import json
 import logging
 import mimetypes
 import os
@@ -14,8 +13,6 @@ import shutil
 import tempfile
 import time
 import urllib.parse
-import urllib.request
-import zipfile
 from pathlib import Path
 from typing import Any, Final, Unpack
 
@@ -27,6 +24,7 @@ from opentelemetry.trace import Status, StatusCode
 from evilflowers_lcpencrypt_worker import telemetry
 from evilflowers_lcpencrypt_worker.helpers import CliValue, ExecutableException, run_executable
 from evilflowers_lcpencrypt_worker.log_format import configure_logging
+from evilflowers_lcpencrypt_worker.package import PublicationMetadata, build_pdf_package, localize, suffix_of
 from evilflowers_lcpencrypt_worker.types import LCPEncryptParams, LCPEncryptResult, StorageMode
 
 logger = logging.getLogger(__name__)
@@ -103,10 +101,6 @@ _MIME_BY_SUFFIX: Final = {
 # so these are probed after the bare file name when looking for the encrypted file.
 _OUTPUT_EXTENSIONS: Final = (".epub", ".lcpdf", ".lcpa", ".lcpdi", ".webpub", ".pdf", ".lpf", ".audiobook")
 
-# Readium Web Publication Manifest constants used when pre-packaging a raw PDF.
-RWPM_CONTEXT: Final = "https://readium.org/webpub-manifest/context.jsonld"
-RWPM_PDF_PROFILE: Final = "https://readium.org/webpub-manifest/profiles/pdf"
-
 
 def _determine_storage_mode(storage: str | None) -> StorageMode:
     """0 (not stored), 1 (S3) or 2 (file system), from the `storage` parameter."""
@@ -142,53 +136,9 @@ def _looks_like_pdf(input_path: str) -> bool:
     return _input_format(input_path) == "pdf"
 
 
-def _localize_pdf(resolved_input: str, temp_dir: str) -> tuple[str, bool]:
-    """Make the PDF available on the local file system.
-
-    Returns `(local_path, downloaded)`; `downloaded` means a temporary copy the caller removes.
-    """
-    if resolved_input.startswith(("http://", "https://")):
-        os.makedirs(temp_dir, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(suffix=".pdf", dir=temp_dir)
-        os.close(fd)
-        urllib.request.urlretrieve(resolved_input, tmp_path)  # noqa: S310 - trusted catalog input
-        return tmp_path, True
-    return resolved_input, False
-
-
-def _build_pdf_readium_package(pdf_path: str, package_path: str, title: str | None, author: str | None) -> None:
-    """Wrap a raw PDF into a minimal Readium Package (RWPP) carrying bibliographic metadata.
-
-    lcpencrypt reads a PDF's title/author only from the PDF's own metadata. Catalog PDFs usually
-    have none, so the generated manifest falls back to a file-name title and no authors, and
-    Thorium shows "no title and no authors available". lcpencrypt keeps an existing manifest for
-    `.rpf` input, so a package whose `manifest.json` carries the metadata yields a correct
-    `.lcpdf`.
-
-    Args:
-        pdf_path: Local path of the source PDF.
-        package_path: Destination of the Readium package (should end in `.rpf`).
-        title: Publication title; falls back to the PDF file stem.
-        author: Publication author; omitted from the manifest when empty.
-    """
-    metadata: dict[str, Any] = {
-        "@type": "http://schema.org/Book",
-        "conformsTo": RWPM_PDF_PROFILE,
-        # RWPM requires a title; mirror lcpencrypt's file-name fallback.
-        "title": title or Path(pdf_path).stem,
-    }
-    if author:
-        metadata["author"] = author
-
-    manifest = {
-        "@context": RWPM_CONTEXT,
-        "metadata": metadata,
-        "readingOrder": [{"href": "publication.pdf", "type": "application/pdf"}],
-    }
-
-    with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(pdf_path, arcname="publication.pdf")
-        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+def _resolve(locator: str, storage_path: str) -> str:
+    """An http(s) URL as is, anything else relative to STORAGE_PATH."""
+    return locator if locator.startswith(("http://", "https://")) else str(Path(storage_path) / locator)
 
 
 def _resolve_local_output(local_file_path: str) -> str | None:
@@ -238,8 +188,10 @@ def lcpencrypt(
     Supported formats: EPUB 2/3, PDF, Readium Packages (audiobooks, DIVINA, …), W3C Audiobooks
     packaged as LPF. Parameters are described in `LCPEncryptParams`.
 
-    For raw-PDF input with `title`/`author`, the PDF is first wrapped into a Readium package
-    whose manifest carries that metadata (best effort: on failure the raw PDF is encrypted).
+    For raw-PDF input with publication metadata (`title`, `authors`, `publisher`, …), the PDF is
+    first wrapped into a Readium package whose manifest carries that metadata plus what
+    lcpencrypt would have added itself: a cover, `numberOfPages` and the PDF's outline as `toc`
+    (best effort: on failure the raw PDF is encrypted).
 
     Environment:
         STORAGE_PATH: Base path for file storage (default `/mnt/data`).
@@ -256,8 +208,6 @@ def lcpencrypt(
     url = params.get("url")
     contentid = params.get("contentid")
     filename = params.get("filename")
-    title = params.get("title")
-    author = params.get("author")
     temp = params.get("temp", "/tmp")  # noqa: S108 - lcpencrypt's own default, overridable per task
     output = params.get("output")
 
@@ -268,9 +218,7 @@ def lcpencrypt(
 
     logger.info("Starting LCP encryption for %s", input_file, extra=log_extra)
 
-    resolved_input = (
-        input_file if input_file.startswith(("http://", "https://")) else str(Path(storage_path) / input_file)
-    )
+    resolved_input = _resolve(input_file, storage_path)
 
     cmd_args: dict[str, CliValue] = {
         "input": resolved_input,
@@ -282,8 +230,7 @@ def lcpencrypt(
     if storage:
         # Recommended mode: lcpencrypt stores the package itself.
         cmd_args["storage"] = storage if storage.startswith("s3:") else str(Path(storage_path) / storage)
-        if url:
-            cmd_args["url"] = url
+        cmd_args["url"] = url
         if filename:
             cmd_args["filename"] = filename
     elif output:
@@ -310,7 +257,23 @@ def lcpencrypt(
         record_exception=False,
         set_status_on_exception=False,
     ) as span:
-        package_temp_dir = _prepackage_pdf(cmd_args, resolved_input, temp, title, author, span)
+        if storage and not url:
+            # lcpencrypt (v1.13.4+) exits with "storage requires url"; say so without running it.
+            _record(span, input_format, "failure", 0.0)
+            span.set_status(Status(StatusCode.ERROR, "storage requires url"))
+            logger.error("LCP encryption refused for %s: storage requires url", input_file, extra=log_extra)
+            return _failed(contentid, storage, input_file, "Invalid parameters: storage requires url")
+
+        package_temp_dir = _prepackage_pdf(
+            cmd_args,
+            resolved_input,
+            temp,
+            PublicationMetadata.from_params(params),
+            cover=_resolve(cover, storage_path) if (cover := params.get("cover")) else None,
+            # lcpencrypt names the stored cover after this entry, as its own PDF path does.
+            cover_name=filename or contentid or "cover",
+            span=span,
+        )
         started = time.perf_counter()
         try:
             result = run_executable(executable_path=lcpencrypt_bin, kwargs_dict=cmd_args, kwargs_key_prefix="-")
@@ -326,17 +289,9 @@ def lcpencrypt(
                 error,
                 extra={**log_extra, "returncode": error.returncode, "stderr": error.stderr, "stdout": error.stdout},
             )
-            return LCPEncryptResult(
-                content_id=contentid or "unknown",
-                content_encryption_key="",
-                storage_mode=_determine_storage_mode(storage),
-                protected_content_location="",
-                protected_content_disposition=Path(input_file).name,
-                protected_content_type="",
-                protected_content_length=0,
-                protected_content_sha256="",
-                success=False,
-                error=f"Encryption failed: {error}" + (f": {reason}" if (reason := _failure_reason(error)) else ""),
+            reason = _failure_reason(error)
+            return _failed(
+                contentid, storage, input_file, f"Encryption failed: {error}" + (f": {reason}" if reason else "")
             )
         finally:
             # Remove the temporary Readium package (and any downloaded PDF next to it).
@@ -351,17 +306,19 @@ def lcpencrypt(
         output_filename = filename or contentid or Path(input_file).stem
         match storage:
             case str() if storage.startswith("s3:"):
-                output_location = f"{url}/{output_filename}" if url else output_filename
+                output_location = f"{url}/{output_filename}"
                 local_file_path = None
             case str() if storage:
                 local_file_path = str(Path(storage_path) / storage / output_filename)
-                output_location = f"{url}/{output_filename}" if url else local_file_path
+                output_location = f"{url}/{output_filename}"
             case _:
                 local_file_path = str(Path(output or temp) / output_filename)
                 output_location = local_file_path
 
         mime_type, file_size, file_hash = "application/octet-stream", 0, ""
         if local_file_path is not None and (found := _resolve_local_output(local_file_path)) is not None:
+            # `found` is `local_file_path` plus the extension lcpencrypt appended (`.lcpdf`, `.epub`, …).
+            output_location += found.removeprefix(local_file_path)
             mime_type, file_size, file_hash = _get_file_info(found)
             telemetry.protected_content_size().record(file_size, {"lcp.input.format": input_format})
             span.set_attribute("lcp.protected_content.size", file_size)
@@ -384,35 +341,74 @@ def _prepackage_pdf(
     cmd_args: dict[str, CliValue],
     resolved_input: str,
     temp: str,
-    title: str | None,
-    author: str | None,
+    metadata: PublicationMetadata,
+    *,
+    cover: str | None,
+    cover_name: str,
     span: trace.Span,
 ) -> str | None:
-    """Swap a raw PDF input for a Readium package carrying title/author; returns its temp dir.
+    """Swap a raw PDF input for a Readium package carrying the metadata; returns its temp dir.
 
-    lcpencrypt has no title/author flags, so for raw-PDF input with metadata the PDF is wrapped
-    in a `.rpf` whose manifest lcpencrypt keeps. Best effort: on any failure the raw PDF is
-    encrypted without the metadata rather than failing the task.
+    lcpencrypt has no metadata flags, so for raw-PDF input with metadata the PDF is wrapped in a
+    `.rpf` whose manifest lcpencrypt keeps. Best effort: on any failure the raw PDF is encrypted
+    without the metadata rather than failing the task. Downloads (remote PDF or cover) live in
+    the package's temp dir, which the caller removes after lcpencrypt ran.
     """
-    if not (title or author) or not _looks_like_pdf(resolved_input):
+    if metadata.is_empty() or not _looks_like_pdf(resolved_input):
         return None
 
     package_temp_dir: str | None = None
     try:
         os.makedirs(temp, exist_ok=True)
-        local_pdf, downloaded = _localize_pdf(resolved_input, temp)
         package_temp_dir = tempfile.mkdtemp(prefix="lcp-rwpp-", dir=temp)
-        package_path = str(Path(package_temp_dir) / f"{Path(local_pdf).stem}.rpf")
-        _build_pdf_readium_package(local_pdf, package_path, title, author)
+        local_pdf, _ = localize(resolved_input, package_temp_dir, ".pdf")
+        local_cover: str | None = None
+        if cover is not None:
+            try:
+                local_cover, _ = localize(cover, package_temp_dir, suffix_of(cover) or ".img")
+            except Exception as error:  # noqa: BLE001 - the first page is rendered instead
+                logger.warning("Could not fetch the catalog cover %s: %s", cover, error)
+
+        package_path = str(Path(package_temp_dir) / f"{Path(resolved_input.split('?')[0]).stem or 'book'}.rpf")
+        report = build_pdf_package(local_pdf, package_path, metadata, cover_source=local_cover, cover_name=cover_name)
         cmd_args["input"] = package_path
-        span.set_attribute("lcp.metadata.injected", True)
-        logger.info("Pre-packaged PDF into a Readium package with title=%r author=%r", title, author)
-        if downloaded:
-            os.remove(local_pdf)
+        span.set_attributes(
+            {
+                "lcp.metadata.injected": True,
+                "lcp.package.cover": report.cover,
+                "lcp.package.pages": report.page_count,
+                "lcp.package.toc_entries": report.toc_entries,
+            }
+        )
+        for warning in report.warnings:
+            span.add_event("lcp.package.warning", {"message": warning})
+        logger.info(
+            "Pre-packaged PDF into a Readium package: title=%r authors=%r cover=%s pages=%d toc=%d",
+            metadata.title,
+            metadata.authors,
+            report.cover,
+            report.page_count,
+            report.toc_entries,
+        )
     except Exception as error:  # noqa: BLE001 - metadata injection is best effort
         logger.warning("Failed to pre-package PDF with metadata, encrypting the raw input: %s", error)
         span.add_event("lcp.metadata.injection_failed", {"exception.message": str(error)})
     return package_temp_dir
+
+
+def _failed(contentid: str | None, storage: str | None, input_file: str, error: str) -> LCPEncryptResult:
+    return LCPEncryptResult(
+        content_id=contentid or "unknown",
+        content_encryption_key="",
+        storage_mode=_determine_storage_mode(storage),
+        protected_content_location="",
+        protected_content_disposition=Path(input_file).name,
+        protected_content_type="",
+        protected_content_length=0,
+        protected_content_sha256="",
+        success=False,
+        error=error,
+    )
 
 
 def _record(span: trace.Span, input_format: str, outcome: str, seconds: float) -> None:

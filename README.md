@@ -168,7 +168,7 @@ Use these for modern deployments with custom storage:
 | Parameter   | Type | Description                                                            |
 |-------------|------|------------------------------------------------------------------------|
 | `storage`   | str  | Target storage location. Format: `s3:region:bucket` or filesystem path |
-| `url`       | str  | Public base URL corresponding to storage location                      |
+| `url`       | str  | Public base URL corresponding to storage location; required with `storage` |
 | `filename`  | str  | Output filename (optional, uses `contentid` if omitted)                |
 | `contentid` | str  | Unique content identifier (optional, UUID generated if omitted)        |
 
@@ -176,23 +176,51 @@ Use these for modern deployments with custom storage:
 
 | Parameter | Type | Default | Description                                                 |
 |-----------|------|---------|-------------------------------------------------------------|
-| `title`   | str  | -       | Publication title, injected into the Readium package manifest for raw-PDF input (see below) |
-| `author`  | str  | -       | Publication author, injected into the Readium package manifest for raw-PDF input (see below) |
 | `temp`    | str  | `/tmp`  | Working directory for temporary files                       |
 | `lcpsv`   | str  | -       | License server endpoint (format: `http://user:pass@host`)   |
 | `notify`  | str  | -       | CMS notification endpoint (format: `http://user:pass@host`) |
 | `verbose` | bool | `False` | Enable verbose logging                                      |
 
-#### PDF title/author metadata
+### Publication Metadata (raw-PDF input)
 
-`lcpencrypt` reads a PDF's title/author only from metadata embedded in the file, so a raw
-catalog PDF (which usually has none) ends up with a filename-derived title and no authors —
-Thorium then shows *"no title and no authors available"*. When `title` and/or `author` are
-provided for a PDF input, the worker first wraps the PDF into a minimal
-[Readium Web Publication](https://readium.org/webpub-manifest/) package whose `manifest.json`
-carries the metadata, then encrypts that package (`lcpencrypt` preserves an existing manifest).
-The resulting `.lcpdf` opens in reading apps with the correct title and author. EPUB inputs
-already carry OPF metadata and are unaffected. A missing/empty `author` is handled gracefully.
+All optional; empty values are ignored. EPUB carries its own OPF metadata and ignores them.
+
+| Parameter                                                   | Type              | Manifest key (RWPM)                    |
+|-------------------------------------------------------------|-------------------|----------------------------------------|
+| `title`                                                     | str               | `title`                                |
+| `subtitle`                                                  | str               | `subtitle`                             |
+| `authors` (or a single `author`)                            | list[str] (str)   | `author`                               |
+| `translators`, `editors`, `illustrators`, `contributors`    | list[str]         | `translator`, `editor`, …              |
+| `publisher`                                                 | str               | `publisher`                            |
+| `language`                                                  | str \| list[str]  | `language` (BCP 47)                    |
+| `published`                                                 | str               | `published`, full `YYYY-MM-DD` only    |
+| `description`                                               | str               | `description`                          |
+| `subjects`                                                  | list[str]         | `subject`                              |
+| `identifier`                                                | str               | `identifier` (`urn:isbn:…`, DOI URL)   |
+| `cover`                                                     | str               | cover image: path under `STORAGE_PATH` or http(s) URL |
+
+#### How PDF metadata reaches the reading app
+
+`lcpencrypt` wraps a raw PDF into a Readium package itself, but it reads bibliographic metadata
+only from the PDF's own Info dictionary; a catalog PDF without one ends up with a file-name
+title and no authors (Thorium: *"no title and no authors available"*). When any metadata
+parameter is given for a PDF input, the worker builds the
+[Readium package](https://readium.org/webpub-manifest/) itself and hands lcpencrypt the `.rpf`,
+whose manifest lcpencrypt keeps. The package carries:
+
+- the catalog metadata above; where the catalog gives nothing, the PDF's own title, author,
+  subject (as `description`) and keywords (as `subject`), then lcpencrypt's file-name title;
+- what lcpencrypt v1.14 adds natively: a cover (the catalog's `cover`, else page 1 rendered to
+  1200 px JPEG) inside the package, and `numberOfPages`. The cover entry is named
+  `<filename>.jpg` like lcpencrypt's own; that name only matters if the worker ever passes
+  `-cover`, which makes lcpencrypt also store the cover next to the publication and send its
+  `cover_url` to the License Server and CMS (it does not today);
+- the PDF's outline as `toc` (`publication.pdf#page=N`).
+
+lcpencrypt round-trips the manifest through its Go `rwpm` struct: keys outside it are dropped
+and a malformed value fails the encryption. That is why `published` must be a full date (a
+partial `2023` is dropped) and the list above is the complete set. Page count, outline and
+cover are best effort: a PDF that pdfium cannot open is still packaged with the metadata.
 
 ### Legacy Mode Parameters
 
@@ -371,6 +399,7 @@ evilflowers_lcpencrypt_worker/
 ├── telemetry.py         # OpenTelemetry setup (collector discovery, providers, instruments)
 ├── log_format.py        # JSON / text log formatting with trace ids
 ├── types.py             # TypedDict wire contract with the catalog
+├── package.py           # Readium package for raw PDFs: metadata, cover, page count, toc
 └── helpers.py           # Executable runner utilities
 ```
 

@@ -22,6 +22,18 @@ This changelog suppose to follow rules defined in the [changelog.md](https://cha
 - **Fixed**: lcpencrypt's normal stderr progress is logged at DEBUG instead of WARNING on success
 - **Changed**: the image installs exactly what `poetry.lock` pins (hash-checked); `requirements.sh` removed
 - **Changed**: `pyproject.toml` uses PEP 621 `[project]` metadata (Poetry 2)
+- **Fixed**: a PDF pre-packaged with the catalog's title/author lost the cover and `numberOfPages`
+  that lcpencrypt v1.14 adds natively. The worker now renders the first page as cover (or uses the
+  catalog's `cover`), and adds `numberOfPages`, the PDF's outline as `toc` and its subject as
+  `description` ([#2](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/2))
+- **Added**: publication metadata params for raw-PDF input: `subtitle`, `authors`, `translators`,
+  `editors`, `illustrators`, `contributors`, `publisher`, `language`, `published`, `description`,
+  `subjects`, `identifier`, `cover` — all that lcpencrypt keeps from a Readium manifest
+  ([#1](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/1))
+- **Added**: dependencies `pypdfium2` (PDF page count, outline, first-page render) and `pillow`
+- **Changed**: `storage` without `url` fails the task up front (lcpencrypt v1.13.4+ refuses it);
+  the "url optional" branch is gone
+- **Fixed**: `protected_content_location` now carries the extension lcpencrypt appended (`.lcpdf`, …)
 
 ## 0.1.0 - TBD
 

@@ -1,21 +1,24 @@
 """Tests for the lcpencrypt Celery task and helper functions."""
 
 import hashlib
+import io
 import json
 import zipfile
 from pathlib import Path
+from typing import Final
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
 from evilflowers_lcpencrypt_worker import (
-    _build_pdf_readium_package,
     _determine_storage_mode,
     _get_file_info,
     _looks_like_pdf,
     lcpencrypt,
 )
 from evilflowers_lcpencrypt_worker.helpers import ExecutableException, ExecutableResult
+from tests.pdf_factory import Bookmark, write_pdf
 
 
 class TestDetermineStorageMode:
@@ -142,63 +145,6 @@ class TestLooksLikePdf:
         assert _looks_like_pdf("https://example.com/files/book.epub") is False
 
 
-class TestBuildPdfReadiumPackage:
-    def _read_manifest(self, package_path):
-        with zipfile.ZipFile(package_path) as archive:
-            names = archive.namelist()
-            manifest = json.loads(archive.read("manifest.json"))
-        return names, manifest
-
-    def test_package_contains_pdf_and_manifest(self, sample_pdf, tmp_path):
-        package_path = str(tmp_path / "out.rpf")
-
-        _build_pdf_readium_package(sample_pdf, package_path, "My Title", "Jane Doe")
-
-        names, manifest = self._read_manifest(package_path)
-        assert "publication.pdf" in names
-        assert "manifest.json" in names
-        assert manifest["metadata"]["title"] == "My Title"
-        assert manifest["metadata"]["author"] == "Jane Doe"
-        assert manifest["metadata"]["conformsTo"] == "https://readium.org/webpub-manifest/profiles/pdf"
-        assert manifest["readingOrder"] == [{"href": "publication.pdf", "type": "application/pdf"}]
-
-    def test_embedded_pdf_matches_source(self, sample_pdf, tmp_path):
-        package_path = str(tmp_path / "out.rpf")
-
-        _build_pdf_readium_package(sample_pdf, package_path, "T", "A")
-
-        with zipfile.ZipFile(package_path) as archive:
-            assert archive.read("publication.pdf") == Path(sample_pdf).read_bytes()
-
-    def test_missing_author_is_omitted(self, sample_pdf, tmp_path):
-        package_path = str(tmp_path / "out.rpf")
-
-        _build_pdf_readium_package(sample_pdf, package_path, "Only Title", None)
-
-        _, manifest = self._read_manifest(package_path)
-        assert manifest["metadata"]["title"] == "Only Title"
-        assert "author" not in manifest["metadata"]
-
-    def test_missing_title_falls_back_to_filename(self, tmp_path):
-        pdf = tmp_path / "the-book.pdf"
-        pdf.write_bytes(b"%PDF-1.4")
-        package_path = str(tmp_path / "out.rpf")
-
-        _build_pdf_readium_package(str(pdf), package_path, None, "Jane Doe")
-
-        _, manifest = self._read_manifest(package_path)
-        assert manifest["metadata"]["title"] == "the-book"
-
-    def test_unicode_metadata_preserved(self, sample_pdf, tmp_path):
-        package_path = str(tmp_path / "out.rpf")
-
-        _build_pdf_readium_package(sample_pdf, package_path, "Žižek: Naše", "Šimon Ő")
-
-        _, manifest = self._read_manifest(package_path)
-        assert manifest["metadata"]["title"] == "Žižek: Naše"
-        assert manifest["metadata"]["author"] == "Šimon Ő"
-
-
 def _call_lcpencrypt(**kwargs):
     """Call the lcpencrypt task directly (Celery handles self binding)."""
     return lcpencrypt.run(**kwargs)
@@ -215,9 +161,11 @@ def _capture_package(holder):
         input_path = kwargs["kwargs_dict"]["input"]
         holder["input"] = input_path
         if input_path.endswith(".rpf") and Path(input_path).exists():
+            holder["temp_entries"] = sorted(path.name for path in Path(input_path).parent.iterdir())
             with zipfile.ZipFile(input_path) as archive:
                 holder["names"] = archive.namelist()
                 holder["manifest"] = json.loads(archive.read("manifest.json"))
+                holder["files"] = {name: archive.read(name) for name in holder["names"] if name.endswith(".jpg")}
         return ExecutableResult(returncode=0, stdout="", stderr="")
 
     return _side_effect
@@ -232,51 +180,54 @@ class TestLcpencryptTask:
 
     @patch("evilflowers_lcpencrypt_worker.run_executable")
     def test_catalog_style_filesystem_storage(self, mock_run, tmp_path, monkeypatch):
-        """Test the exact parameters the EvilFlowersCatalog sends.
-
-        The catalog sends: input_file, contentid, storage, filename, lcpsv, notify
-        It does NOT send: url
-        """
+        """The parameters EvilFlowersCatalog sends (`_queue_encryption_task`, develop)."""
         monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
 
-        # Simulate catalog file structure
-        catalog_dir = tmp_path / "catalogs" / "my-catalog" / "entry-uuid"
-        catalog_dir.mkdir(parents=True)
-        encrypted_dir = catalog_dir / "encrypted"
-        encrypted_dir.mkdir()
+        entry_dir = tmp_path / "catalogs" / "my-catalog" / "entry-uuid"
+        source_dir = entry_dir / "encrypted" / "source" / "abc-123-uuid"
+        source_dir.mkdir(parents=True)
+        write_pdf(source_dir / "book.pdf", pages=2)
 
-        input_file = catalog_dir / "book.pdf"
-        input_file.write_bytes(b"%PDF-1.4 content")
+        def run(*args, **kwargs):
+            # lcpencrypt writes `<filename>.lcpdf` into the storage directory
+            (entry_dir / "encrypted" / "abc-123-uuid.lcpdf").write_bytes(b"PK-encrypted")
+            return _capture_package(holder)(*args, **kwargs)
 
-        # Simulate encrypted output (created by lcpencrypt binary)
-        output_file = encrypted_dir / "abc-123-uuid.lcp.pdf"
-        output_file.write_bytes(b"%PDF-encrypted-content")
-
-        mock_run.return_value = ExecutableResult(
-            returncode=0,
-            stdout="Content encryption key: deadbeef1234\n",
-            stderr="",
-        )
+        holder: dict = {}
+        mock_run.side_effect = run
 
         result = _call_lcpencrypt(
-            input_file="catalogs/my-catalog/entry-uuid/book.pdf",
+            input_file="catalogs/my-catalog/entry-uuid/encrypted/source/abc-123-uuid/book.pdf",
             contentid="abc-123-uuid",
-            storage="catalogs/my-catalog/entry-uuid",
-            filename="encrypted/abc-123-uuid.lcp.pdf",
-            lcpsv="http://readium:8989",
-            notify="http://django:8000/api/readium/hooks/encryption",
+            storage="catalogs/my-catalog/entry-uuid/encrypted",
+            filename="abc-123-uuid",
+            lcpsv="http://user:pass@readium:8989",
+            notify="http://user:pass@django:8000/api/readium/hooks/encryption",
+            url="https://elvira.example/readium/v1/content",
+            title="The Book",
+            author="Ada Lovelace",
+            temp=str(tmp_path / "tmp"),
         )
 
         assert result["success"] is True
         assert result["content_id"] == "abc-123-uuid"
         assert result["storage_mode"] == 2  # filesystem
+        # What lcpencrypt registers: url + the file it wrote, extension included.
+        assert result["protected_content_location"] == "https://elvira.example/readium/v1/content/abc-123-uuid.lcpdf"
+        assert result["protected_content_type"] == "application/pdf+lcp"
+        assert result["protected_content_length"] == len(b"PK-encrypted")
 
-        # Verify storage was passed to the binary
-        cmd_args = mock_run.call_args.kwargs.get("kwargs_dict") or mock_run.call_args[1].get("kwargs_dict")
-        assert cmd_args["storage"] == str(catalog_dir)
-        assert cmd_args["filename"] == "encrypted/abc-123-uuid.lcp.pdf"
-        assert cmd_args["lcpsv"] == "http://readium:8989"
-        assert cmd_args["notify"] == "http://django:8000/api/readium/hooks/encryption"
+        cmd_args = mock_run.call_args.kwargs["kwargs_dict"]
+        assert cmd_args["storage"] == str(entry_dir / "encrypted")
+        assert cmd_args["url"] == "https://elvira.example/readium/v1/content"
+        assert cmd_args["filename"] == "abc-123-uuid"
+        assert cmd_args["lcpsv"] == "http://user:pass@readium:8989"
+        assert cmd_args["notify"] == "http://user:pass@django:8000/api/readium/hooks/encryption"
+        # Issue #2: the package carries the cover (named like lcpencrypt names it) and the page count.
+        assert cmd_args["input"].endswith(".rpf")
+        assert set(holder["names"]) == {"publication.pdf", "abc-123-uuid.jpg", "manifest.json"}
+        assert holder["manifest"]["metadata"]["numberOfPages"] == 2
+        assert holder["manifest"]["metadata"]["author"] == "Ada Lovelace"
 
     @patch("evilflowers_lcpencrypt_worker.run_executable")
     def test_filesystem_storage_with_url(self, mock_run, tmp_path, monkeypatch):
@@ -480,6 +431,7 @@ class TestLcpencryptTask:
         result = _call_lcpencrypt(
             input_file="input.epub",
             storage="storage",
+            url="https://cdn.example.com",
             contentid="test-id",
             filename="test-id.epub",
         )
@@ -499,6 +451,7 @@ class TestLcpencryptTask:
         result = _call_lcpencrypt(
             input_file="input.epub",
             storage="storage",
+            url="https://cdn.example.com",
             contentid="missing-file",
         )
 
@@ -596,56 +549,20 @@ class TestLcpencryptTask:
         cmd_args = mock_run.call_args.kwargs.get("kwargs_dict") or mock_run.call_args[1].get("kwargs_dict")
         assert cmd_args["temp"] == "/tmp"
 
+    @pytest.mark.parametrize("storage", ["catalogs/my-catalog/entry", "s3:eu-west-3:bucket"])
+    @pytest.mark.parametrize("url", [None, ""])
     @patch("evilflowers_lcpencrypt_worker.run_executable")
-    def test_output_location_filesystem_no_url(self, mock_run, tmp_path, monkeypatch):
-        """Test that output_location is a local path when url is not provided."""
-        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
-
-        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
-
-        result = _call_lcpencrypt(
-            input_file="book.epub",
-            storage="catalogs/my-catalog/entry-uuid",
-            contentid="abc-uuid",
-            filename="encrypted/abc-uuid.lcp.pdf",
-        )
-
-        expected_path = str(tmp_path / "catalogs" / "my-catalog" / "entry-uuid" / "encrypted" / "abc-uuid.lcp.pdf")
-        assert result["protected_content_location"] == expected_path
-
-    @patch("evilflowers_lcpencrypt_worker.run_executable")
-    def test_s3_storage_without_url(self, mock_run, monkeypatch):
-        """Test S3 storage without URL returns just the filename."""
+    def test_storage_without_url_is_refused(self, mock_run, monkeypatch, storage, url):
+        """lcpencrypt (v1.13.4, v1.14.0) exits with `storage requires url`; the task says so up front."""
         monkeypatch.setenv("STORAGE_PATH", "/mnt/data")
 
-        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
+        kwargs = {"url": url} if url is not None else {}
+        result = _call_lcpencrypt(input_file="book.epub", storage=storage, contentid="test-id", **kwargs)
 
-        result = _call_lcpencrypt(
-            input_file="book.epub",
-            storage="s3:eu-west-3:bucket",
-            contentid="test",
-            filename="test.epub",
-        )
-
-        assert result["protected_content_location"] == "test.epub"
-
-    @patch("evilflowers_lcpencrypt_worker.run_executable")
-    def test_storage_without_url_passes_storage_to_binary(self, mock_run, tmp_path, monkeypatch):
-        """Verify that storage is passed to the binary even without url."""
-        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
-
-        mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
-
-        _call_lcpencrypt(
-            input_file="book.epub",
-            storage="catalogs/my-catalog/entry",
-            filename="encrypted/out.lcp.pdf",
-            contentid="test-id",
-        )
-
-        cmd_args = mock_run.call_args.kwargs.get("kwargs_dict") or mock_run.call_args[1].get("kwargs_dict")
-        assert "storage" in cmd_args
-        assert cmd_args["storage"] == str(tmp_path / "catalogs" / "my-catalog" / "entry")
+        mock_run.assert_not_called()
+        assert result["success"] is False
+        assert result["error"] == "Invalid parameters: storage requires url"
+        assert result["content_id"] == "test-id"
 
     @patch("evilflowers_lcpencrypt_worker.run_executable")
     def test_absolute_output_not_prepended(self, mock_run, monkeypatch):
@@ -680,6 +597,7 @@ class TestPdfMetadataPackaging:
             input_file="book.pdf",
             contentid="abc-uuid",
             storage="encrypted",
+            url="https://cdn.example.com",
             filename="abc-uuid",
             title="The Great Book",
             author="Ada Lovelace",
@@ -777,7 +695,7 @@ class TestPdfMetadataPackaging:
     def test_packaging_failure_falls_back_to_raw_pdf(self, mock_run, tmp_path, monkeypatch):
         monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
 
-        # Input PDF does not exist on disk → _build_pdf_readium_package raises, fallback kicks in
+        # Input PDF does not exist on disk → build_pdf_package raises, fallback kicks in
         mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
 
         result = _call_lcpencrypt(
@@ -807,7 +725,7 @@ class TestPdfMetadataPackaging:
         holder = {}
         mock_run.side_effect = _capture_package(holder)
 
-        with patch("evilflowers_lcpencrypt_worker.urllib.request.urlretrieve", side_effect=fake_urlretrieve):
+        with patch("evilflowers_lcpencrypt_worker.package.urllib.request.urlretrieve", side_effect=fake_urlretrieve):
             result = _call_lcpencrypt(
                 input_file="https://example.com/files/book.pdf?token=xyz",
                 contentid="id",
@@ -818,4 +736,166 @@ class TestPdfMetadataPackaging:
 
         assert result["success"] is True
         assert holder["input"].endswith(".rpf")
+        assert Path(holder["input"]).name == "book.rpf"
         assert holder["manifest"]["metadata"]["title"] == "Remote Title"
+        # The download lives in the package's temp dir and goes with it.
+        assert list((tmp_path / "tmp").iterdir()) == []
+
+
+class TestPdfEnrichment:
+    """Issue #2: the pre-packaged PDF carries what lcpencrypt adds natively, plus the catalog's metadata."""
+
+    CATALOG_METADATA: Final = {
+        "title": "Logika a výpočty",
+        "subtitle": "Úvod",
+        "authors": ["Ada Lovelace", "Alan Turing"],
+        "translators": ["Ján Prekladateľ"],
+        "publisher": "STU Press",
+        "language": "sk",
+        "published": "2021-09-01",
+        "description": "Učebnica.",
+        "subjects": ["Logic", "Computing"],
+        "identifier": "urn:isbn:9788022700000",
+    }
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_full_catalog_metadata(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(
+            tmp_path / "book.pdf",
+            pages=4,
+            info={"Title": "ignored", "Author": "ignored"},
+            outline=[Bookmark("Intro", 0), Bookmark("Body", 1, [Bookmark("Part", 2)])],
+        )
+        holder: dict = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        result = _call_lcpencrypt(
+            input_file="book.pdf",
+            contentid="cid",
+            filename="cid",
+            storage="enc",
+            url="https://cdn.example.com",
+            temp=str(tmp_path / "tmp"),
+            **self.CATALOG_METADATA,
+        )
+
+        assert result["success"] is True
+        meta = holder["manifest"]["metadata"]
+        assert meta == {
+            "@type": "http://schema.org/Book",
+            "conformsTo": "https://readium.org/webpub-manifest/profiles/pdf",
+            "title": "Logika a výpočty",
+            "subtitle": "Úvod",
+            "author": ["Ada Lovelace", "Alan Turing"],
+            "translator": "Ján Prekladateľ",
+            "publisher": "STU Press",
+            "language": "sk",
+            "published": "2021-09-01",
+            "description": "Učebnica.",
+            "subject": ["Logic", "Computing"],
+            "identifier": "urn:isbn:9788022700000",
+            "numberOfPages": 4,
+        }
+        assert holder["manifest"]["resources"] == [{"rel": ["cover"], "href": "cid.jpg", "type": "image/jpeg"}]
+        assert [link["href"] for link in holder["manifest"]["toc"]] == [
+            "publication.pdf#page=1",
+            "publication.pdf#page=2",
+        ]
+        assert holder["manifest"]["toc"][1]["children"] == [{"href": "publication.pdf#page=3", "title": "Part"}]
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_partial_published_date_is_dropped(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(tmp_path / "book.pdf")
+        holder: dict = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        _call_lcpencrypt(input_file="book.pdf", contentid="c", title="T", published="2021", temp=str(tmp_path / "t"))
+
+        assert "published" not in holder["manifest"]["metadata"]
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_metadata_without_title_triggers_packaging(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(tmp_path / "my_book.pdf", info={"Title": "Embedded Title"})
+        holder: dict = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        _call_lcpencrypt(input_file="my_book.pdf", contentid="c", publisher="STU", temp=str(tmp_path / "t"))
+
+        assert holder["manifest"]["metadata"]["title"] == "Embedded Title"
+        assert holder["manifest"]["metadata"]["publisher"] == "STU"
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_catalog_cover_relative_to_storage_path(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(tmp_path / "book.pdf")
+        (tmp_path / "covers").mkdir()
+        Image.new("RGB", (600, 900), (0, 128, 0)).save(tmp_path / "covers" / "c.png")
+        holder: dict = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        _call_lcpencrypt(
+            input_file="book.pdf",
+            contentid="cid",
+            title="T",
+            cover="covers/c.png",
+            temp=str(tmp_path / "t"),
+        )
+
+        with Image.open(io.BytesIO(holder["files"]["cid.jpg"])) as cover:
+            # The catalog's green cover (scaled to fit 1200 px), not a render of the PDF's page.
+            assert cover.size == (600, 900)
+            red, green, blue = cover.getpixel((300, 450))
+            assert green > 100 and red < 30 and blue < 30
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_remote_catalog_cover_is_downloaded(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(tmp_path / "book.pdf")
+        cover_source = tmp_path / "remote.jpg"
+        Image.new("RGB", (300, 300), (0, 0, 255)).save(cover_source)
+        seen: list[str] = []
+
+        def fake_urlretrieve(url, dest):
+            seen.append(url)
+            Path(dest).write_bytes(cover_source.read_bytes())
+            return dest, None
+
+        holder: dict = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        with patch("evilflowers_lcpencrypt_worker.package.urllib.request.urlretrieve", side_effect=fake_urlretrieve):
+            _call_lcpencrypt(
+                input_file="book.pdf",
+                contentid="cid",
+                title="T",
+                cover="https://elvira.example/covers/1.jpg",
+                temp=str(tmp_path / "t"),
+            )
+
+        assert seen == ["https://elvira.example/covers/1.jpg"]
+        assert "cid.jpg" in holder["names"]
+        assert list((tmp_path / "t").iterdir()) == []
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_unreachable_catalog_cover_falls_back_to_first_page(self, mock_run, tmp_path, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", str(tmp_path))
+        write_pdf(tmp_path / "book.pdf")
+        holder: dict = {}
+        mock_run.side_effect = _capture_package(holder)
+
+        with patch(
+            "evilflowers_lcpencrypt_worker.package.urllib.request.urlretrieve", side_effect=OSError("unreachable")
+        ):
+            result = _call_lcpencrypt(
+                input_file="book.pdf",
+                contentid="cid",
+                title="T",
+                cover="https://elvira.example/covers/1.jpg",
+                temp=str(tmp_path / "t"),
+            )
+
+        assert result["success"] is True
+        assert "cid.jpg" in holder["names"]

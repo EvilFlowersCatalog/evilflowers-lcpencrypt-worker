@@ -65,7 +65,9 @@ class TestTaskSpan:
         mock_run.return_value = ExecutableResult(returncode=0, stdout="", stderr="")
         before = _count("lcpencrypt.encryptions", **{"lcp.outcome": "success", "lcp.input.format": "epub"})
 
-        result = lcpencrypt.run(input_file="src/book.epub", contentid="cid-1", storage="enc", filename="cid-1")
+        result = lcpencrypt.run(
+            input_file="src/book.epub", contentid="cid-1", storage="enc", url="https://cdn", filename="cid-1"
+        )
 
         assert result["success"] is True
         (span,) = spans.get_finished_spans()
@@ -107,6 +109,10 @@ class TestTaskSpan:
 
         (span,) = spans.get_finished_spans()
         assert span.attributes["lcp.metadata.injected"] is True
+        # A fake PDF: packaged with the metadata, without cover or page count.
+        assert span.attributes["lcp.package.cover"] == "none"
+        assert span.attributes["lcp.package.pages"] == 0
+        assert "lcp.package.warning" in [event.name for event in span.events]
 
     @patch("evilflowers_lcpencrypt_worker.run_executable")
     def test_metadata_injection_failure_is_an_event(self, mock_run, spans, monkeypatch, tmp_path):
@@ -129,10 +135,23 @@ class TestFailureReason:
             "lcpencrypt", 1, "Parameters : incorrect parameters, storage requires url \n", ""
         )
 
-        result = lcpencrypt.run(input_file="book.epub", contentid="c", storage="enc")
+        result = lcpencrypt.run(input_file="book.epub", contentid="c", storage="enc", url="https://cdn")
 
         assert result["error"].startswith("Encryption failed: lcpencrypt exited with return code 1: ")
         assert result["error"].endswith("storage requires url")
+
+    @patch("evilflowers_lcpencrypt_worker.run_executable")
+    def test_storage_without_url_is_refused_up_front(self, mock_run, spans, monkeypatch):
+        monkeypatch.setenv("STORAGE_PATH", "/mnt/data")
+
+        result = lcpencrypt.run(input_file="book.epub", contentid="c", storage="enc")
+
+        mock_run.assert_not_called()
+        assert result["success"] is False
+        assert result["error"] == "Invalid parameters: storage requires url"
+        (span,) = spans.get_finished_spans()
+        assert span.status.status_code is StatusCode.ERROR
+        assert span.attributes["lcp.outcome"] == "failure"
 
     @patch("evilflowers_lcpencrypt_worker.run_executable")
     def test_stderr_preferred_and_empty_streams_tolerated(self, mock_run, spans, monkeypatch):
