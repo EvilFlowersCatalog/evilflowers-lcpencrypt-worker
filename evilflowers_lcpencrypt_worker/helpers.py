@@ -1,15 +1,25 @@
-"""Helper functions for executing external binaries."""
+"""Helpers for executing external binaries."""
 
 import logging
 import os
+import shlex
 import subprocess
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from evilflowers_lcpencrypt_worker.log_format import redact
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
+type CliValue = str | int | float | bool | None
+"""A keyword argument value: `True` becomes a bare flag, `False`/`None` are dropped."""
+
 
 class ExecutableException(Exception):
-    """Exception raised when an executable exits with a non-zero return code.
+    """An executable exited with a non-zero return code.
 
     Attributes:
         executable_path: Path to the executable that failed.
@@ -18,6 +28,12 @@ class ExecutableException(Exception):
         stderr: Standard error from the executable.
         command: Full command that was executed (optional).
     """
+
+    executable_path: str
+    returncode: int
+    stdout: str
+    stderr: str
+    command: str | None
 
     def __init__(
         self,
@@ -35,25 +51,38 @@ class ExecutableException(Exception):
         super().__init__(f"{executable_path} exited with return code {returncode}")
 
 
+@dataclass(frozen=True, slots=True)
 class ExecutableResult:
-    """Result from executing an external binary.
+    """Result of a successful run of an external binary."""
 
-    Attributes:
-        returncode: Exit code returned by the executable.
-        stdout: Standard output from the executable.
-        stderr: Standard error from the executable.
-    """
+    returncode: int
+    stdout: str
+    stderr: str
 
-    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
+
+def build_command(
+    executable_path: str,
+    args_list: Sequence[str] | None = None,
+    kwargs_dict: Mapping[str, CliValue] | None = None,
+    kwargs_key_prefix: str = "--",
+) -> list[str]:
+    """Build the argv: executable, positional arguments, then `<prefix>key=value` options."""
+    options: list[str] = []
+    for key, value in (kwargs_dict or {}).items():
+        match value:
+            case None | False:
+                continue
+            case True:
+                options.append(f"{kwargs_key_prefix}{key}")
+            case _:
+                options.append(f"{kwargs_key_prefix}{key}={value}")
+    return [executable_path, *(args_list or []), *options]
 
 
 def run_executable(
     executable_path: str,
-    args_list: list[str] | None = None,
-    kwargs_dict: dict[str, Any] | None = None,
+    args_list: Sequence[str] | None = None,
+    kwargs_dict: Mapping[str, CliValue] | None = None,
     kwargs_key_prefix: str = "--",
 ) -> ExecutableResult:
     """Execute an external binary with the given arguments.
@@ -61,13 +90,12 @@ def run_executable(
     Args:
         executable_path: Path to the executable to run.
         args_list: Positional arguments to pass to the executable.
-        kwargs_dict: Keyword arguments to pass to the executable. Boolean values
-                     will be converted to flags (just the key), other values will
-                     be passed as key=value pairs.
-        kwargs_key_prefix: Prefix for keyword argument keys (default: '--').
+        kwargs_dict: Keyword arguments. `True` becomes a bare flag, `None`/`False` are dropped,
+            anything else is passed as `<prefix>key=value`.
+        kwargs_key_prefix: Prefix for keyword argument keys (default: `--`).
 
     Returns:
-        ExecutableResult containing the return code, stdout, and stderr.
+        ExecutableResult with the return code, stdout and stderr.
 
     Raises:
         ExecutableException: If the executable returns a non-zero exit code.
@@ -76,41 +104,24 @@ def run_executable(
         >>> result = run_executable(
         ...     "/usr/bin/lcpencrypt",
         ...     kwargs_dict={"input": "file.epub", "verbose": True},
-        ...     kwargs_key_prefix="-"
+        ...     kwargs_key_prefix="-",
         ... )
-        >>> print(result.stdout)
     """
-    if kwargs_dict is None:
-        kwargs_dict = {}
+    kwargs_dict = kwargs_dict or {}
 
-    # Create storage directory if needed (filesystem storage only)
-    if "storage" in kwargs_dict:
-        storage_path = kwargs_dict["storage"]
-        if storage_path and not storage_path.startswith("s3:"):
+    # Filesystem storage only: lcpencrypt does not create the target directory itself.
+    match kwargs_dict.get("storage"):
+        case str(storage_path) if storage_path and not storage_path.startswith("s3:"):
             os.makedirs(storage_path, exist_ok=True)
-            logger.debug(f"Ensured storage directory exists: {storage_path}")
+            logger.debug("Ensured storage directory exists: %s", storage_path)
+        case _:
+            pass
 
-    # Convert keyword arguments to command-line format
-    kwargs_list = []
-    for key, value in kwargs_dict.items():
-        if value is None:
-            continue
+    command = build_command(executable_path, args_list, kwargs_dict, kwargs_key_prefix)
+    printable = shlex.join(command)
+    logger.info("Executing command: %s", _redact(printable))
 
-        if isinstance(value, bool):
-            if value:
-                # Boolean true becomes a flag
-                kwargs_list.append(f"{kwargs_key_prefix}{key}")
-        else:
-            # Other values become key=value pairs
-            kwargs_list.append(f"{kwargs_key_prefix}{key}={value}")
-
-    # Build complete command
-    command = [executable_path] + (args_list or []) + kwargs_list
-
-    logger.info(f"Executing command: {' '.join(command)}")
-
-    # Execute the command
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: UP022 - explicit pipes; tests pin these kwargs
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -118,15 +129,16 @@ def run_executable(
         check=False,
     )
 
-    # Log output
     if result.stdout:
-        logger.debug(f"Command stdout: {result.stdout}")
-    if result.stderr:
-        logger.warning(f"Command stderr: {result.stderr}")
+        logger.debug("Command stdout: %s", result.stdout)
 
-    # Check for errors
     if result.returncode != 0:
-        logger.error(f"Command failed with return code {result.returncode}: {' '.join(command)}")
+        logger.error(
+            "Command failed with return code %s: %s",
+            result.returncode,
+            _redact(printable),
+            extra={"stderr": result.stderr},
+        )
         raise ExecutableException(
             executable_path=executable_path,
             returncode=result.returncode,
@@ -135,8 +147,16 @@ def run_executable(
             command=" ".join(command),
         )
 
-    return ExecutableResult(
-        returncode=result.returncode,
-        stdout=result.stdout,
-        stderr=result.stderr,
-    )
+    # lcpencrypt (Go `log`) writes its normal progress to stderr: not a warning on success.
+    if result.stderr:
+        logger.debug("Command stderr: %s", result.stderr)
+
+    return ExecutableResult(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+
+def _redact(command: str) -> str:
+    """Hide `user:password@` in URLs (`-lcpsv`, `-notify`) even under a formatter that does not."""
+    return redact(command)
+
+
+__all__ = ["CliValue", "ExecutableException", "ExecutableResult", "build_command", "run_executable"]

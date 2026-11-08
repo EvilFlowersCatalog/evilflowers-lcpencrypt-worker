@@ -2,10 +2,9 @@
 
 import hashlib
 import json
-import os
 import zipfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -67,7 +66,7 @@ class TestGetFileInfo:
         content = b"audiobook-content"
         audiobook.write_bytes(content)
 
-        mime_type, size, sha256 = _get_file_info(str(audiobook))
+        mime_type, _size, _sha256 = _get_file_info(str(audiobook))
 
         assert mime_type == "application/audiobook+zip"
 

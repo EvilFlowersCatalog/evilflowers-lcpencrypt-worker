@@ -2,49 +2,50 @@ name: Docker build
 
 on:
   push:
-    branches: [ master ]
+    branches: [ master, develop ]
     # Publish semver tags as releases.
     tags: [ '*.*.*' ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, develop ]
 
 env:
   REGISTRY: ghcr.io
   DOCKER_BUILDKIT: 1
 
-jobs:
-  build:
+# A newer push to develop (or a PR update) supersedes the running build + deploy: the deploy
+# checks that the pods run the digest it built, so two overlapping runs would fail each other.
+# master and release tags always finish.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/develop' }}
 
+jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
+  build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
       packages: write
       attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
 
     steps:
       - name: Set lowercase image name
-        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
-
-      - name: Install poetry
-        run: |
-          sudo apt install -y pipx
-          pipx ensurepath
-          pipx install poetry
-          pipx inject poetry poetry-plugin-export
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Create requirements.txt
-        run: |
-          poetry export -f requirements.txt --without-hashes --output requirements.txt -E observability
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log into registry ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
@@ -54,14 +55,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :develop / :master (what the Deployments pull), :sha-<short> (rollback by hand),
+      # and semver tags for releases.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         id: push
         with:
           context: .
@@ -73,14 +81,51 @@ jobs:
           cache-to: ${{ github.event_name != 'pull_request' && format('type=registry,ref={0}/{1}:buildcache,mode=max', env.REGISTRY, env.IMAGE_NAME) || '' }}
           provenance: ${{ github.event_name != 'pull_request' }}
           sbom: ${{ github.event_name != 'pull_request' }}
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
 
       - name: Attest
         if: github.event_name != 'pull_request'
         uses: actions/attest-build-provenance@v2
-        id: attest
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  # Development = k3s namespace evilflowers-dev, Deployment `lcpencrypt` (Ansible role
+  # roles/evilflowers_k8s in EvilFlowersCatalog/knowledge; cookbook Deploy-a-Service §4, CI-Runner).
+  #
+  # The Deployment must pin `:develop` with imagePullPolicy Always: a rollout restart is then a
+  # redeploy. The job runs on the self-hosted runner INSIDE k3s (runs-on: elvira-k3s); its
+  # ServiceAccount arc-deployer may only restart Deployments in github_runner_deploy_namespaces,
+  # and this repository must be in the runner group's selected repositories.
+  # A push never changes the pod's env; that needs the role's playbook.
+  deploy-development:
+    needs: build
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/develop'
+      && github.repository == 'EvilFlowersCatalog/evilflowers-lcpencrypt-worker'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: development
+      environment-url: https://dev.evilflowers.elvira.stuba.sk
+      namespace: evilflowers-dev
+      instance: dev
+      digest: ${{ needs.build.outputs.digest }}
+
+  # Production = master → namespace evilflowers-prod. Prod still runs on Docker Compose
+  # (gateway), so this stays off until the prod cutover to k3s: then set the repository variable
+  # PRODUCTION_DEPLOY_ENABLED=true and give the `production` environment required reviewers.
+  deploy-production:
+    needs: build
+    if: >-
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/master'
+      && github.repository == 'EvilFlowersCatalog/evilflowers-lcpencrypt-worker'
+      && vars.PRODUCTION_DEPLOY_ENABLED == 'true'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: production
+      environment-url: https://evilflowers.elvira.stuba.sk
+      namespace: evilflowers-prod
+      instance: prod
+      digest: ${{ needs.build.outputs.digest }}

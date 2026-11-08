@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # ARC runner scale set inside the ELVIRA k3s cluster (knowledge: roles/github_runner).
+  labels:
+    - elvira-k3s

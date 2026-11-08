@@ -1,20 +1,37 @@
-[tool.poetry]
+[project]
 name = "evilflowers-lcpencrypt-worker"
-version = "0.1.0"
-description = "EvilFlowers Redium lcpencrypt Worker"
-authors = ["Jakub Dubec <jakub.dubec@stuba.sk>"]
+version = "0.2.0"
+description = "EvilFlowers Readium lcpencrypt Worker"
+authors = [{ name = "Jakub Dubec", email = "jakub.dubec@stuba.sk" }]
 readme = "README.md"
+requires-python = ">=3.14,<4"
+dependencies = [
+    "celery[redis] (>=5.5,<6)",
+    # The task code uses the API only (spans, metrics, trace ids in logs); without the SDK
+    # from the `observability` extra every call is a no-op. Same release train as the catalog
+    # (EvilFlowersCatalog IP-019): API/SDK/exporter 1.x and contrib 0.yb0 move together.
+    "opentelemetry-api (==1.45.2)",
+]
 
-[tool.poetry.dependencies]
-python = "^3.14"
-celery = {version = "^5.5.0", extras = ["redis"]}
-logfire = {version = "*", extras = ["celery", "redis", "system-metrics"], optional = true}
+[project.optional-dependencies]
+observability = [
+    "opentelemetry-sdk (==1.45.2)",
+    "opentelemetry-exporter-otlp-proto-http (==1.45.2)",
+    "opentelemetry-instrumentation-celery (==0.66b2)",
+    "opentelemetry-instrumentation-system-metrics (==0.66b2)",
+]
 
-[tool.poetry.extras]
-observability = ["logfire"]
+[project.scripts]
+evilflowers-lcpencrypt-worker = "evilflowers_lcpencrypt_worker.__main__:main"
+
+[tool.poetry]
+packages = [{ include = "evilflowers_lcpencrypt_worker" }]
 
 [tool.poetry.group.dev.dependencies]
 black = "^26.1.0"
+ruff = "^0.14"
+mypy = "^1.18"
+celery-types = "^0.23"
 pytest = "^8.0"
 pytest-cov = "^6.0"
 
@@ -31,10 +48,34 @@ exclude = '''
 )/
 '''
 
+[tool.ruff]
+line-length = 119
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "S", "BLE", "G", "LOG", "TC"]
+ignore = [
+    "S603",  # subprocess without shell: the argv is built from typed task kwargs, never a shell string
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "BLE001"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+warn_unreachable = true
+files = ["evilflowers_lcpencrypt_worker"]
+
+[[tool.mypy.overrides]]
+# Optional SDK packages ship without py.typed markers in places; the API is typed.
+module = ["opentelemetry.instrumentation.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.0"]
 build-backend = "poetry.core.masonry.api"

@@ -1,15 +1,41 @@
 name: Tests
 
-on: [push, pull_request]
+# Pushes to and PRs into develop/master run this through docker.yml (as the build's gate), so
+# they are excluded here to avoid running it twice.
+on:
+  pull_request:
+    branches-ignore: [ develop, master ]
+  push:
+    branches-ignore: [ develop, master ]
+  workflow_call:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  check:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
-    - uses: psf/black@stable
-      with:
-        options: ". --check"
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install poetry
+        run: pipx install "poetry>=2,<3"
+
+      - name: Install dependencies (locked, with the observability extra)
+        run: poetry sync --all-extras
+
+      - name: ruff
+        run: poetry run ruff check --output-format=github .
+
+      - name: black
+        run: poetry run black --check .
+
+      - name: mypy (strict)
+        run: poetry run mypy
+
+      - name: pytest
+        run: poetry run pytest --cov=evilflowers_lcpencrypt_worker --cov-report=term-missing

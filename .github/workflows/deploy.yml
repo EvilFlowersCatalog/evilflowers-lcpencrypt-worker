@@ -1,0 +1,75 @@
+name: Deploy to k3s
+
+# Reusable: restart the `lcpencrypt` Deployment of one EvilFlowers instance onto the image just
+# pushed, then prove the running pods use that digest. Same mechanics as the catalog's deploy job
+# (EvilFlowersCatalog .github/workflows/build.yml).
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub environment (development | production)
+        type: string
+        required: true
+      environment-url:
+        type: string
+        required: true
+      namespace:
+        description: k8s namespace of the instance (evilflowers-dev | evilflowers-prod)
+        type: string
+        required: true
+      instance:
+        description: app.kubernetes.io/instance label value (dev | prod)
+        type: string
+        required: true
+      digest:
+        description: Image digest the build pushed (sha256:...)
+        type: string
+        required: true
+
+jobs:
+  rollout:
+    runs-on: elvira-k3s            # ARC scale set inside k3s (knowledge: roles/github_runner)
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.environment-url }}
+    concurrency:
+      group: deploy-lcpencrypt-${{ inputs.namespace }}
+      cancel-in-progress: false
+    permissions: {}
+    env:
+      NAMESPACE: ${{ inputs.namespace }}
+      DEPLOYMENT: lcpencrypt
+      SELECTOR: app.kubernetes.io/name=lcpencrypt,app.kubernetes.io/instance=${{ inputs.instance }}
+      DIGEST: ${{ inputs.digest }}
+      KUBECTL_VERSION: v1.31.5     # = the cluster (k3s v1.31.5+k3s1)
+      KUBECTL_SHA256: fbecbfd375b3686002c2e81d51c390172f5ffba3d6b47920d55342cb03f557af   # dl.k8s.io …/linux/amd64/kubectl.sha256
+    steps:
+      # The runner image has no kubectl; the pod is deleted after the job, so nothing is cached.
+      - name: kubectl ${{ env.KUBECTL_VERSION }} (checksum-pinned)
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/kubectl" "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          echo "${KUBECTL_SHA256}  $RUNNER_TEMP/kubectl" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/kubectl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      # In-cluster credentials: the pod's ServiceAccount arc-deployer.
+      - name: Restart onto the new image
+        run: kubectl -n "$NAMESPACE" rollout restart "deployment/$DEPLOYMENT"
+
+      # Strategy Recreate; acks_late means a running encryption is finished or redelivered.
+      - name: Wait for the rollout
+        run: kubectl -n "$NAMESPACE" rollout status "deployment/$DEPLOYMENT" --timeout=300s
+
+      # The tag could have moved, or the pull could have failed silently onto a cached image.
+      # Pods still terminating are skipped. A newer push cancels this run (workflow concurrency).
+      - name: Running pods use ${{ inputs.digest }}
+        run: |
+          ids=$(kubectl -n "$NAMESPACE" get pods -l "$SELECTOR" \
+            -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{range .status.containerStatuses}}{{.imageID}}{{"\n"}}{{end}}{{end}}{{end}}')
+          echo "$ids"
+          test -n "$ids"
+          if echo "$ids" | grep -v -- "@${DIGEST}\$"; then
+            echo "::error::a running pod does not use ${DIGEST}"
+            exit 1
+          fi

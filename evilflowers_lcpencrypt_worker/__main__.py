@@ -31,9 +31,12 @@ Environment Variables:
   STORAGE_PATH                Base path for file storage (default: /mnt/data)
   READIUM_LCPENCRYPT_BIN      Path to lcpencrypt binary (default: lcpencrypt)
   LOG_LEVEL                   Logging level (default: INFO)
-  LOGFIRE_TOKEN                Logfire write token (enables observability)
-  LOGFIRE_SERVICE_NAME         Service name for Logfire (default: evilflowers-lcpencrypt-worker)
-  LOGFIRE_ENVIRONMENT          Environment name (default: development)
+  LOG_FORMAT                  json | text (default: text; the container image sets json)
+  OTEL_EXPORTER_OTLP_ENDPOINT OTLP/HTTP collector, e.g. http://$(HOST_IP):4318
+  HOST_IP                     Node IP (k8s downward API); probed on :4318 when no endpoint is set
+  OTEL_SERVICE_NAME           Service name in traces and metrics (default: lcpencrypt)
+  OTEL_RESOURCE_ATTRIBUTES    e.g. deployment.environment.name=development
+  OTEL_SDK_DISABLED           true turns telemetry off
 
 Examples:
   python -m evilflowers_lcpencrypt_worker
@@ -127,8 +130,7 @@ Examples:
 
     args = parser.parse_args()
 
-    logger.info(f"Starting Celery worker for queue: {args.queue}")
-    logger.info(f"Broker: {app.conf.broker_url}")
+    logger.info("Starting Celery worker for queue: %s", args.queue)
 
     # Build worker arguments
     worker_args = [
@@ -161,13 +163,14 @@ Examples:
 
     try:
         # Start the worker (prepend 'worker' command)
-        app.worker_main(argv=["worker"] + worker_args)
-        return 0
+        app.worker_main(argv=["worker", *worker_args])
+        # Typed NoReturn (it ends in sys.exit), but a mocked or embedded worker returns.
+        return 0  # type: ignore[unreachable]
     except KeyboardInterrupt:
         logger.info("Worker shutdown requested by user")
         return 0
-    except Exception as e:
-        logger.error(f"Worker failed to start: {e}", exc_info=True)
+    except Exception as e:  # noqa: BLE001 - CLI boundary: report any startup failure as exit 1
+        logger.exception("Worker failed to start: %s", e)
         return 1
 
 

@@ -6,11 +6,13 @@ comprehensive error handling and result tracking.
 
 ## Features
 
-- **Modern Python typing**: Full type hints using TypedDict and modern Python 3.12+ syntax
+- **Readium lcpencrypt v1.14.0**: pinned in the image (`LCPENCRYPT_VERSION` build arg)
+- **Modern Python typing**: Python 3.14, `mypy --strict`, TypedDict wire contract, PEP 695 aliases
 - **Comprehensive result tracking**: Returns detailed encryption results including file metadata and encryption keys
 - **Multiple storage modes**: Support for S3, filesystem, and legacy storage modes
 - **Format support**: EPUB 2/3, PDF, Audiobooks, Readium Packages, W3C Audiobooks
-- **OpenTelemetry integration**: Optional distributed tracing support
+- **OpenTelemetry (LGTM)**: OTLP traces + metrics to Grafana Alloy, JSON logs with `trace_id` for Loki;
+  the worker's span continues the catalog's trace (see [Observability](#observability))
 - **Proper error handling**: Structured exceptions with detailed error information
 - **Production-ready**: Task acknowledgment, worker loss detection, and retry configuration
 
@@ -223,14 +225,61 @@ The task returns an `LCPEncryptResult` TypedDict:
 
 ## Environment Variables
 
-| Variable                      | Description                      | Default                         | Example                     |
-|-------------------------------|----------------------------------|---------------------------------|-----------------------------|
-| `BROKER`                      | Celery broker URL                | `redis://localhost:6379/0`      | `redis://redis:6379/0`      |
-| `LOG_LEVEL`                   | Logging level                    | `INFO`                          | `DEBUG`                     |
-| `STORAGE_PATH`                | Base path for file storage       | `/mnt/data`                     | `/var/lib/lcp/storage`      |
-| `READIUM_LCPENCRYPT_BIN`      | Path to `lcpencrypt` binary      | `lcpencrypt`                    | `/usr/local/bin/lcpencrypt` |
-| `OTEL_SERVICE_NAME`           | Service name for OpenTelemetry   | `evilflowers-lcpencrypt-worker` | -                           |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry Collector endpoint | -                               | `http://collector:4317`     |
+| Variable                      | Description                                        | Default                    | Example                                   |
+|-------------------------------|----------------------------------------------------|----------------------------|-------------------------------------------|
+| `BROKER`                      | Celery broker URL                                  | `redis://localhost:6379/7` | `redis://redis:6379/7`                    |
+| `LOG_LEVEL`                   | Logging level                                      | `INFO`                     | `DEBUG`                                   |
+| `LOG_FORMAT`                  | `json` (one object per line) or `text`             | `text` (image: `json`)     | `json`                                    |
+| `STORAGE_PATH`                | Base path for file storage                         | `/mnt/data`                | `/var/local/evilflowers`                  |
+| `READIUM_LCPENCRYPT_BIN`      | Path to `lcpencrypt` binary                        | `lcpencrypt`               | `/usr/local/bin/lcpencrypt`               |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector                                | discovered (see below)     | `http://$(HOST_IP):4318`                  |
+| `HOST_IP`                     | Node IP (k8s downward API), probed on `:4318`      | -                          | `status.hostIP`                           |
+| `OTEL_SERVICE_NAME`           | `service.name` in traces/metrics                   | `lcpencrypt`               | `lcpencrypt`                              |
+| `OTEL_RESOURCE_ATTRIBUTES`    | Extra resource attributes                          | -                          | `deployment.environment.name=development` |
+| `OTEL_SDK_DISABLED`           | `true` turns telemetry off                         | -                          | `true`                                    |
+
+Any other standard `OTEL_*` variable (`OTEL_TRACES_EXPORTER=console`, `OTEL_METRIC_EXPORT_INTERVAL`, …)
+is honoured by the SDK.
+
+## Observability
+
+Same contract as the catalog (EvilFlowersCatalog IP-019) and the ELVIRA *Deploy a service* cookbook.
+The SDK is the `observability` extra (installed in the image); without it every call is a no-op.
+
+- **Collector**: OTLP/HTTP. Endpoint precedence: `OTEL_EXPORTER_OTLP_ENDPOINT` → `HOST_IP:4318`
+  → the container's default gateway `:4318` (Docker bridge → host Alloy). Nothing answering = off,
+  logged once; no exporter retrying against localhost.
+- **Traces**: `CeleryInstrumentor` continues the catalog's trace from the task headers:
+  `catalog → apply_async (producer) → run (consumer) → lcpencrypt`. The `lcpencrypt` span carries
+  `lcp.content_id`, `lcp.input.format`, `lcp.storage_mode`, `lcp.metadata.injected`, `lcp.outcome`,
+  `process.exit.code`, `lcp.protected_content.size`; a failed run sets status `ERROR`.
+  The broker's Redis traffic is deliberately not traced (it would be one orphan root span per poll).
+- **Metrics**: `lcpencrypt.encryption.duration` (s, histogram), `lcpencrypt.encryptions` (counter),
+  `lcpencrypt.protected_content.size` (By), all by `lcp.input.format` / `lcp.outcome`; plus
+  per-process `process.*` (CPU, memory, threads, fds) to tell prefork children apart.
+- **Logs**: not exported over OTLP. Alloy tails stdout; with `LOG_FORMAT=json` every line has
+  `level`, `logger`, `msg`, and inside a task `trace_id`/`span_id`, `content_id`, `task_id`.
+  URL credentials (`-lcpsv`, `-notify`) are redacted from logged commands.
+- **Process model**: the collector is discovered once in the main process (`worker_init`), the SDK
+  is set up in each prefork child (`worker_process_init`) and flushed on `worker_process_shutdown`.
+
+In Grafana: Tempo `{resource.service.name="lcpencrypt"}`, Loki `{service_name="lcpencrypt"} | json`.
+In k8s the pod should carry `elvira.stuba.sk/instrumentation: otel-sdk` so Beyla does not trace it twice.
+
+## Deployment
+
+`.github/workflows/docker.yml` tests, builds and pushes `ghcr.io/evilflowerscatalog/evilflowers-lcpencrypt-worker`
+(`linux/amd64` + `linux/arm64`; tags `:<branch>`, `:sha-<short>`, semver) and then deploys:
+
+| Branch    | Target                                                   | State                                                    |
+|-----------|----------------------------------------------------------|----------------------------------------------------------|
+| `develop` | k3s `evilflowers-dev`, Deployment `lcpencrypt` (`:develop`) | automatic                                                |
+| `master`  | k3s `evilflowers-prod`, Deployment `lcpencrypt` (`:master`) | off until prod runs in k3s: `vars.PRODUCTION_DEPLOY_ENABLED=true` |
+
+The deploy job (`deploy.yml`) runs on the in-cluster runner `elvira-k3s`: `rollout restart`,
+`rollout status`, then verifies every running pod uses the digest just built. The manifest itself
+(env, labels, image tag) is owned by the Ansible role `evilflowers_k8s` in EvilFlowersCatalog/knowledge;
+a push never changes the pod's env.
 
 ## Supported Formats
 
@@ -297,25 +346,31 @@ params: LCPEncryptParams = {
 result: LCPEncryptResult = lcpencrypt.delay(**params).get()
 ```
 
-### Testing
+### Checks (the same as CI)
 
 ```bash
-poetry run pytest
+poetry sync --all-extras
+poetry run ruff check .
+poetry run black --check .
+poetry run mypy            # strict
+poetry run pytest --cov=evilflowers_lcpencrypt_worker
 ```
 
-### Code Formatting
+### Upgrading lcpencrypt
 
-```bash
-poetry run black evilflowers_lcpencrypt_worker/
-```
+Bump `LCPENCRYPT_VERSION` in the `Dockerfile`, build, and encrypt a real PDF and EPUB inside the
+image before merging: since v1.14.0 the binary links MuPDF (cgo), so it must load in the runtime image.
+Note: lcpencrypt requires `url` whenever `storage` is given (`storage requires url`).
 
 ## Architecture
 
 ```
 evilflowers_lcpencrypt_worker/
-├── __init__.py          # Main Celery task and app
+├── __init__.py          # Celery app, signal wiring, the lcpencrypt task
 ├── __main__.py          # CLI entry point for starting worker
-├── types.py             # TypedDict definitions
+├── telemetry.py         # OpenTelemetry setup (collector discovery, providers, instruments)
+├── log_format.py        # JSON / text log formatting with trace ids
+├── types.py             # TypedDict wire contract with the catalog
 └── helpers.py           # Executable runner utilities
 ```
 

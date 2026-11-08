@@ -2,6 +2,27 @@
 
 This changelog suppose to follow rules defined in the [changelog.md](https://changelog.md)
 
+## 0.2.0 - TBD
+
+- **Changed**: Readium `lcpencrypt` pinned to **v1.14.0** (was an unpinned `@latest`); builder and
+  runtime images share Debian trixie because the binary now links MuPDF through cgo
+- **Changed**: observability moved from Logfire to the OpenTelemetry SDK (OTLP/HTTP to Grafana
+  Alloy, catalog release train 1.45.2 / 0.66b2). Fixes the dev pod logging every Redis command as a
+  WARNING (Logfire's console fallback without a token) and exporting nothing to Tempo
+- **Added**: `lcpencrypt` span continuing the catalog's trace, `lcpencrypt.*` metrics, per-process metrics
+- **Added**: JSON logs (`LOG_FORMAT=json`, image default) with `level`, `trace_id`, `content_id`, `task_id`
+- **Added**: CI gate (ruff, black, mypy strict, pytest) and k3s auto-deploy: `develop` →
+  `evilflowers-dev`; `master` → `evilflowers-prod` behind `vars.PRODUCTION_DEPLOY_ENABLED`
+- **Fixed**: the container's PID 1 was `sh`, so SIGTERM never reached Celery (killed after the grace period)
+- **Fixed**: License Server / CMS credentials (`lcpsv`, `notify`) were written to the logs, both in
+  the lcpencrypt command line and in Celery's own task lines; every log line is now redacted
+- **Changed**: `worker_prefetch_multiplier=1` (one long-running subprocess per task: never reserve
+  a second message behind it)
+- **Fixed**: a failed run's `error` now carries lcpencrypt's reason (it prints parameter errors on stdout)
+- **Fixed**: lcpencrypt's normal stderr progress is logged at DEBUG instead of WARNING on success
+- **Changed**: the image installs exactly what `poetry.lock` pins (hash-checked); `requirements.sh` removed
+- **Changed**: `pyproject.toml` uses PEP 621 `[project]` metadata (Poetry 2)
+
 ## 0.1.0 - TBD
 
 Initial minimum valuable product pre-release.
