@@ -60,6 +60,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S105", "S106", "S108", "BLE001"]
+"tools/memory/test_*.py" = ["S101"]
 
 [tool.mypy]
 python_version = "3.14"
@@ -73,7 +74,7 @@ module = ["opentelemetry.instrumentation.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tools/memory"]
 pythonpath = ["."]
 
 [build-system]

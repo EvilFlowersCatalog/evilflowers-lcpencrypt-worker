@@ -3,3 +3,5 @@
 __pycache__
 requirements.txt
 .mcp.json
+# Per-user Claude settings (autoMemoryDirectory, hooks); .claude/memory itself is tracked
+.claude/settings.local.json
