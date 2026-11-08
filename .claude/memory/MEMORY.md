@@ -10,5 +10,5 @@ Last dream: 2026-11-08 (moved into the repo from the machine-local memory: 4 pag
 - [feedback-scope-to-this-repo](feedback-scope-to-this-repo.md) — Local filesystem = this repo only; other EvilFlowers repos through the GitHub MCP, and changes there as issues, not edits
 
 ## Project state (dated; check `verified`)
-- [project-k8s-deploy-and-otel](project-k8s-deploy-and-otel.md) — Where the worker runs (k3s evilflowers-dev), how CI deploys it, what blocks the first develop push, and the OTel contract
+- [project-k8s-deploy-and-otel](project-k8s-deploy-and-otel.md) — Where the worker runs (k3s evilflowers-dev), how CI deploys it (develop auto-deploy works since c37f894), and the OTel contract
 - [project-lcpencrypt-worker](project-lcpencrypt-worker.md) — Catalog wire contract, lcpencrypt v1.14 quirks, Python 3.14 traps and how to run the checks in this repo
