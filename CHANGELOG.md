@@ -46,6 +46,9 @@ This changelog suppose to follow rules defined in the [changelog.md](https://cha
   `lcp.package.manifest` span event, the `package_preview` task and
   `python -m evilflowers_lcpencrypt_worker.preview`, to check a package without Thorium
   ([#4](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/4))
+- **Added**: `CELERY_HOSTNAME` sets the image's Celery node name (default `lcpencrypt@%h`), so the
+  k8s worker keeps one stable name in Flower across rollouts
+  ([#5](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/5))
 
 ## 0.1.0 - TBD
 

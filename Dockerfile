@@ -55,18 +55,21 @@ COPY pyproject.toml README.md ./
 COPY evilflowers_lcpencrypt_worker/ evilflowers_lcpencrypt_worker/
 RUN pip install --root-user-action=ignore --no-deps --no-cache-dir .
 
-# Docker/Compose only (Kubernetes ignores HEALTHCHECK). Pings this worker, not the whole cluster.
+# Docker/Compose only (Kubernetes ignores HEALTHCHECK). Pings this worker, not the whole cluster:
+# the same node name as the ENTRYPOINT (a `%h` inside CELERY_HOSTNAME is not expanded here).
 HEALTHCHECK --interval=60s --timeout=15s --start-period=20s --retries=3 \
-    CMD celery -A evilflowers_lcpencrypt_worker inspect ping -d "lcpencrypt@$(hostname)" --timeout 10 || exit 1
+    CMD celery -A evilflowers_lcpencrypt_worker inspect ping -d "${CELERY_HOSTNAME:-lcpencrypt@$(hostname)}" --timeout 10 || exit 1
 
 # `exec`: Celery becomes PID 1 and receives SIGTERM, so it finishes the running task (acks_late)
 # and flushes telemetry within the pod's grace period. `-E` keeps task events for Flower.
+# Node name: CELERY_HOSTNAME (k8s sets a stable `lcpencrypt@dev`, so Flower keeps one worker across
+# rollouts), else `lcpencrypt@<container hostname>`.
 ENTRYPOINT ["sh", "-c", "exec celery -A evilflowers_lcpencrypt_worker worker \
     -Q evilflowers_lcpencrypt_worker \
     --concurrency=${CELERY_CONCURRENCY} \
     --max-tasks-per-child=${CELERY_MAX_TASKS_PER_CHILD} \
     --loglevel=${CELERY_LOG_LEVEL} \
-    --hostname=lcpencrypt@%h \
+    --hostname=${CELERY_HOSTNAME:-lcpencrypt@%h} \
     --without-mingle \
     --without-gossip \
     -E"]

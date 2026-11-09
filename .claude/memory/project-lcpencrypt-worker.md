@@ -6,7 +6,7 @@ metadata:
   type: project
   verified: 2026-11-08
   originSessionId: 0c064b23-8064-4a5f-9bbb-5e6b4a4211ed
-  modified: 2026-11-08T15:16:08.339Z
+  modified: 2026-11-08T15:23:42.367Z
 ---
 
 - Catalog (`apps/readium/services/content_encryption_service.py`, develop) sends `input_file`,
@@ -24,7 +24,7 @@ metadata:
 - lcpencrypt v1.14 (`lcpencrypt/lcpencrypt.go`): every `exitWithError` reason goes to stdout, stderr
   is Go `log` progress; a failed `-notify` prints `Error notifying the CMS: …`, withdraws the
   content from the License Server and still exits 0. The task treats that as failure (worker #3).
-- 2026-11-08 (worker #3, #4, uncommitted): `report` kwarg → `evilflowers_lcpencrypt_worker/report.py`;
+- 2026-11-08 (worker #3, #4, closed; e80e73b live on dev, sidecar seen in trace): `report` kwarg → `evilflowers_lcpencrypt_worker/report.py`;
   sidecar `{filename}.manifest.json`, `package_preview` task, CLI `python -m
   evilflowers_lcpencrypt_worker.preview` (not `.package`: `__init__` imports it, runpy warns).
   Catalog side of the report endpoint is catalog#99, not built yet.

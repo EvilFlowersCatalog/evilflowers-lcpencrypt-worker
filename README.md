@@ -316,6 +316,7 @@ What a reading app will show can be checked without borrowing the publication:
 | `LOG_FORMAT`                  | `json` (one object per line) or `text`             | `text` (image: `json`)     | `json`                                    |
 | `STORAGE_PATH`                | Base path for file storage                         | `/mnt/data`                | `/var/local/evilflowers`                  |
 | `READIUM_LCPENCRYPT_BIN`      | Path to `lcpencrypt` binary                        | `lcpencrypt`               | `/usr/local/bin/lcpencrypt`               |
+| `CELERY_HOSTNAME`             | Celery node name (image entrypoint and health check) | `lcpencrypt@%h`          | `lcpencrypt@dev`                          |
 | `MANIFEST_SIDECAR`            | Write `{filename}.manifest.json` next to the package | `true`                   | `false`                                   |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector                                | discovered (see below)     | `http://$(HOST_IP):4318`                  |
 | `HOST_IP`                     | Node IP (k8s downward API), probed on `:4318`      | -                          | `status.hostIP`                           |
