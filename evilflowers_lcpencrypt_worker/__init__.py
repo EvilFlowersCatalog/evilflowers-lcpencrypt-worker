@@ -48,6 +48,20 @@ logger = logging.getLogger(__name__)
 
 QUEUE: Final = "evilflowers_lcpencrypt_worker"
 
+# Matches the catalog's `CELERY_BROKER_VISIBILITY_TIMEOUT` and the analyzer's default (12 h).
+_DEFAULT_VISIBILITY_TIMEOUT: Final = 43200
+
+
+def _visibility_timeout() -> int:
+    """`BROKER_VISIBILITY_TIMEOUT` in seconds (default 12 h).
+
+    Every consumer of a Redis db restores *all* unacked tasks older than its own visibility
+    timeout, in any queue. The dev broker db also carries extraction tasks that run for hours
+    (EvilFlowersCatalog#120), so this must not be shorter than theirs (worker #6).
+    """
+    return int(os.getenv("BROKER_VISIBILITY_TIMEOUT", str(_DEFAULT_VISIBILITY_TIMEOUT)))
+
+
 app = Celery("evilflowers_lcpencrypt_worker", broker=os.getenv("BROKER", "redis://localhost:6379/7"))
 app.conf.update(
     broker_connection_retry_on_startup=True,
@@ -57,6 +71,7 @@ app.conf.update(
     accept_content=["json"],
     # One long-running subprocess per task: never reserve a second message behind it.
     worker_prefetch_multiplier=1,
+    broker_transport_options={"visibility_timeout": _visibility_timeout()},
 )
 
 

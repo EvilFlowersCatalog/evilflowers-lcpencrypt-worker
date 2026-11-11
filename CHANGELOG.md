@@ -49,6 +49,11 @@ This changelog suppose to follow rules defined in the [changelog.md](https://cha
 - **Added**: `CELERY_HOSTNAME` sets the image's Celery node name (default `lcpencrypt@%h`), so the
   k8s worker keeps one stable name in Flower across rollouts
   ([#5](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/5))
+- **Fixed**: the worker ran with kombu's default Redis `visibility_timeout` of 1 h and, sharing
+  the broker db with the extraction pipeline, redelivered any of its tasks held longer than that.
+  It is now `BROKER_VISIBILITY_TIMEOUT` (default 12 h, as the catalog and the analyzer); a lost
+  encryption is redelivered after up to 12 h
+  ([#6](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/6))
 
 ## 0.1.0 - TBD
 

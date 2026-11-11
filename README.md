@@ -312,6 +312,7 @@ What a reading app will show can be checked without borrowing the publication:
 | Variable                      | Description                                        | Default                    | Example                                   |
 |-------------------------------|----------------------------------------------------|----------------------------|-------------------------------------------|
 | `BROKER`                      | Celery broker URL                                  | `redis://localhost:6379/7` | `redis://redis:6379/7`                    |
+| `BROKER_VISIBILITY_TIMEOUT`   | Redis `visibility_timeout` (s); not shorter than any other consumer's on the same db | `43200` | `43200`                  |
 | `LOG_LEVEL`                   | Logging level                                      | `INFO`                     | `DEBUG`                                   |
 | `LOG_FORMAT`                  | `json` (one object per line) or `text`             | `text` (image: `json`)     | `json`                                    |
 | `STORAGE_PATH`                | Base path for file storage                         | `/mnt/data`                | `/var/local/evilflowers`                  |

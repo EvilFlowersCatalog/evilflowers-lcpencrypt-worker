@@ -6,7 +6,7 @@ metadata:
   type: project
   verified: 2026-11-08
   originSessionId: 0c064b23-8064-4a5f-9bbb-5e6b4a4211ed
-  modified: 2026-11-08T15:23:42.367Z
+  modified: 2026-11-11T13:50:02.210Z
 ---
 
 - Catalog (`apps/readium/services/content_encryption_service.py`, develop) sends `input_file`,
@@ -32,6 +32,12 @@ metadata:
   jobs; `registered` needs `reencrypt` (management command only, catalog#98). Follow a run in Loki by
   content id → `trace_id` → Tempo. Filed: catalog#97 (catalog CI blocked, #96 not on dev), #98, #99,
   worker #3 (report outcomes), #4 (manifest sidecar/preview), knowledge#6 (entity + edges).
+- 2026-11-09 (worker #5, closed; 06aebc1): image node name is `${CELERY_HOSTNAME:-lcpencrypt@%h}`;
+  dev shows `lcpencrypt@dev` in Flower (env from knowledge#13). Compose default on the new image
+  untested until prod (`:master`) gets it. Vault row: knowledge#15.
+- 2026-11-11 (worker #6, closed; uncommitted at close): `broker_transport_options.visibility_timeout`
+  = `BROKER_VISIBILITY_TIMEOUT` (default 43200). Dev Redis db 7 is shared with extraction; any
+  consumer restores every unacked task older than its own timeout. Verify after rollout: knowledge#30 §4.
 - Python 3.14 lazy annotations: Celery reads `__annotations__`, so `Task[...]` must stay a string.
 - Checks: local pipx Poetry is broken, use `uvx --python 3.14 poetry -C <repo> run pytest|ruff|mypy|black`.
   Test the task with `lcpencrypt.run(**kwargs)`, mock `evilflowers_lcpencrypt_worker.run_executable`.

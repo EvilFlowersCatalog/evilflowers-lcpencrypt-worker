@@ -16,11 +16,28 @@ from evilflowers_lcpencrypt_worker import (
     _determine_storage_mode,
     _get_file_info,
     _looks_like_pdf,
+    _visibility_timeout,
+    app,
     lcpencrypt,
     package_preview,
 )
 from evilflowers_lcpencrypt_worker.helpers import ExecutableException, ExecutableResult
 from tests.pdf_factory import Bookmark, write_pdf
+
+
+class TestBrokerVisibilityTimeout:
+    """Worker #6: a 1 h default redelivered other services' long tasks on the shared Redis db."""
+
+    def test_app_default_is_12_hours(self):
+        assert app.conf.broker_transport_options["visibility_timeout"] == 43200
+
+    def test_default_without_env(self, monkeypatch):
+        monkeypatch.delenv("BROKER_VISIBILITY_TIMEOUT", raising=False)
+        assert _visibility_timeout() == 43200
+
+    def test_follows_env(self, monkeypatch):
+        monkeypatch.setenv("BROKER_VISIBILITY_TIMEOUT", "7200")
+        assert _visibility_timeout() == 7200
 
 
 class TestDetermineStorageMode:
