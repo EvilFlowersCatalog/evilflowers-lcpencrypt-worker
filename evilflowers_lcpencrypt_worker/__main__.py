@@ -31,11 +31,13 @@ Environment Variables:
   STORAGE_PATH                Base path for file storage (default: /mnt/data)
   READIUM_LCPENCRYPT_BIN      Path to lcpencrypt binary (default: lcpencrypt)
   MANIFEST_SIDECAR            false: no {filename}.manifest.json next to the package (default: true)
-  LOG_LEVEL                   Logging level (default: INFO)
+  MAX_DELIVERIES              Deliveries before a message is given up and reported failed (default: 5)
+  WORKER_SOFT_SHUTDOWN_TIMEOUT / WORKER_CANCEL_TIMEOUT
+                              SIGTERM grace, then cancel + requeue (default: 15 / 10 s)
   LOG_FORMAT                  json | text (default: text; the container image sets json)
   OTEL_EXPORTER_OTLP_ENDPOINT OTLP/HTTP collector, e.g. http://$(HOST_IP):4318
-  HOST_IP                     Node IP (k8s downward API); probed on :4318 when no endpoint is set
-  OTEL_SERVICE_NAME           Service name in traces and metrics (default: lcpencrypt)
+  HOST_IP                     Node IP (k8s downward API); the endpoint is derived from it when unset
+  OTEL_SERVICE_NAME           Service name in traces and metrics (image: lcpencrypt)
   OTEL_RESOURCE_ATTRIBUTES    e.g. deployment.environment.name=development
   OTEL_SDK_DISABLED           true turns telemetry off
 

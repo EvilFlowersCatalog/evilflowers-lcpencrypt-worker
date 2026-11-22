@@ -6,20 +6,31 @@ authors = [{ name = "Jakub Dubec", email = "jakub.dubec@stuba.sk" }]
 readme = "README.md"
 requires-python = ">=3.14,<4"
 dependencies = [
-    "celery[redis] (>=5.5,<6)",
+    # The shared worker runtime (worker #8): delivery cap, SIGTERM protocol, visibility timeout,
+    # telemetry and JSON logs. Tracks the kit's `master` (never a development branch or commit);
+    # poetry.lock records the resolved commit, `poetry update evilflowers-worker` moves it.
+    "evilflowers-worker @ git+https://github.com/EvilFlowersCatalog/evilflowers-worker.git@master",
+    # The kit's floor.
+    "celery[redis] (>=5.6,<6)",
     # The task code uses the API only (spans, metrics, trace ids in logs); without the SDK
     # from the `observability` extra every call is a no-op. Same release train as the catalog
     # (EvilFlowersCatalog IP-019): API/SDK/exporter 1.x and contrib 0.yb0 move together.
     "opentelemetry-api (==1.45.2)",
+    "pydantic (>=2.12,<3)",
+    "pydantic-settings (>=2.7,<3)",
     "pypdfium2 (>=5,<6)",
     "pillow (>=12,<13)",
 ]
 
 [project.optional-dependencies]
+# What the kit's `otel` extra lists, spelled out: Poetry merges `evilflowers-worker[otel]` here into the main
+# `evilflowers-worker` dependency and drops the extra, which locked no SDK at all (CI run 44968567266).
+# Keep the versions on the kit's (and the catalog's) release train.
 observability = [
     "opentelemetry-sdk (==1.45.2)",
     "opentelemetry-exporter-otlp-proto-http (==1.45.2)",
     "opentelemetry-instrumentation-celery (==0.66b2)",
+    "opentelemetry-instrumentation-requests (==0.66b2)",
     "opentelemetry-instrumentation-system-metrics (==0.66b2)",
 ]
 
@@ -73,6 +84,11 @@ files = ["evilflowers_lcpencrypt_worker"]
 [[tool.mypy.overrides]]
 # Optional SDK packages ship without py.typed markers in places; the API is typed.
 module = ["opentelemetry.instrumentation.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# evilflowers-worker ships no py.typed marker yet; its objects are Any here.
+module = ["evilflowers_worker", "evilflowers_worker.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

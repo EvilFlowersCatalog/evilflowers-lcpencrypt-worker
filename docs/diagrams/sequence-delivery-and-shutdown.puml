@@ -1,0 +1,49 @@
+@startuml sequence-delivery-and-shutdown
+!include elvira.iuml
+' What: on the evilflowers-worker runtime a SIGTERM requeues the running encryption at once and reports nothing,
+'       and a publication that killed the worker MAX_DELIVERIES times is reported failed instead of looping.
+' Kind: UML sequence diagram. Scope: one encryption task on the dev pod; lcpencrypt's own calls (-lcpsv, -notify)
+'       and the success path are left out.
+' Source: evilflowers_lcpencrypt_worker/__init__.py, settings.py; evilflowers-worker master runtime.py, shutdown.py,
+'         deliveries.py; Applications/LCPEncrypt-Worker, ansible role evilflowers_k8s (grace 30 s) (2026-11-22)
+
+title lcpencrypt worker: delivery cap and SIGTERM (evilflowers-lcpencrypt-worker#8, 2026-11-22)
+
+participant "Redis db 7\nqueue evilflowers_lcpencrypt_worker" as redis
+participant "kubelet" as kubelet
+participant "worker (PID 1)\nCelery + evilflowers-worker" as worker <<focus>>
+participant "pool child\nlcpencrypt task" as child
+participant "catalog\nreport URL" as catalog
+
+== A publication that kills the worker ==
+redis -> worker : deliver (redelivered = true)
+worker -> child : task message
+child -> redis : INCR evilflowers:deliveries:lcpencrypt:<task id> (run_task)
+alt delivery ≤ MAX_DELIVERIES (5)
+  child -> child : run lcpencrypt: OOM / crash
+  child --> worker : WorkerLostError
+  worker -> redis : reject, requeue (reject_on_worker_lost)
+else delivery > MAX_DELIVERIES
+  child -> child : _give_up (lcpencrypt not run)
+  child -[$accent_msg()]> catalog : <b>POST report</b>\nsuccess false, "Gave up after 5 deliveries"
+  child --> worker : raise DeliveriesExhausted
+  worker -> redis : ack (never delivered again)
+end
+
+== Rollout or scale-in ==
+kubelet -> worker : SIGTERM
+worker -> worker : warm shutdown, no new messages
+alt the run ends within WORKER_SOFT_SHUTDOWN_TIMEOUT (15 s)
+  child -> catalog : POST report (its real outcome)
+  worker -> redis : ack
+else still running after 15 s
+  worker -> redis : DECR the delivery count (a requeue is not a loss)
+  worker -> child : SIGQUIT (cold shutdown, cancel)
+  worker -[$accent_msg()]> redis : <b>message back at once</b>\n(fallback: restore it itself after WORKER_CANCEL_TIMEOUT, 10 s)
+  note right of catalog : nothing reported:\nthe redelivery reports
+end
+worker --> kubelet : exit, inside the 30 s grace
+
+caption A crash loop now ends in one failed report; a stopped pod puts its run back on the queue within 25 s instead of after the 12 h visibility timeout.
+footer ELVIRA · FIIT STU · evilflowers-lcpencrypt-worker · docs/diagrams/sequence-delivery-and-shutdown.puml
+@enduml

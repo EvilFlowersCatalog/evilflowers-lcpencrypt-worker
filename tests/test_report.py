@@ -11,7 +11,7 @@ import pytest
 
 from evilflowers_lcpencrypt_worker import lcpencrypt
 from evilflowers_lcpencrypt_worker.helpers import ExecutableResult
-from evilflowers_lcpencrypt_worker.log_format import redact
+from evilflowers_lcpencrypt_worker.logs import redact
 from evilflowers_lcpencrypt_worker.package import PackageReport
 from evilflowers_lcpencrypt_worker.report import encryption_report, send_report, split_credentials
 

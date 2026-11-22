@@ -6,7 +6,7 @@ metadata:
   type: project
   verified: 2026-11-08
   originSessionId: 0c064b23-8064-4a5f-9bbb-5e6b4a4211ed
-  modified: 2026-11-11T13:50:02.210Z
+  modified: 2026-11-22T00:56:02.212Z
 ---
 
 - Catalog (`apps/readium/services/content_encryption_service.py`, develop) sends `input_file`,
@@ -38,10 +38,23 @@ metadata:
 - 2026-11-11 (worker #6, closed; uncommitted at close): `broker_transport_options.visibility_timeout`
   = `BROKER_VISIBILITY_TIMEOUT` (default 43200). Dev Redis db 7 is shared with extraction; any
   consumer restores every unacked task older than its own timeout. Verify after rollout: knowledge#30 §4.
+- 2026-11-22 (worker #8, closed; uncommitted at close on `feature/8-adopt-evilflowers-worker`): runtime is the
+  evilflowers-worker kit referenced as `@master` (user: never a commit hash or a development build; the lock pins
+  the resolved commit) (`create_app`, `run_task`, cap, shutdown, JSON logs). Traps: the kit reads
+  `REDIS_URL`, `evilflowers_lcpencrypt_worker/settings.py` aliases `BROKER` first; pod grace is the k8s default
+  30 s, so shutdown is 15 + 10 s; the kit's formatter drops `extra=` (use `observability.bind`), `logs.py` wraps it
+  for redaction; the kit has no py.typed (mypy override, `app: Celery` annotation); the Dockerfile builds the
+  git dep as a wheel (`--require-hashes` refuses VCS lines). Poetry drops `evilflowers-worker[otel]` in an extra
+  when the main deps list the kit too: the lock had no SDK (CI run 44968567266), so the `observability` extra
+  lists the otel packages itself and the Dockerfile import-checks them. `poetry lock` keeps an old git
+  `reference`; `poetry update --lock evilflowers-worker` rewrites it. Role follow-up: knowledge#103 → PR knowledge#104 (comment + explicit 30 s grace). Alloy
+  upper-cases the `level` label, so lower-case kit levels need no dashboard change.
 - Python 3.14 lazy annotations: Celery reads `__annotations__`, so `Task[...]` must stay a string.
 - Checks: local pipx Poetry is broken, use `uvx --python 3.14 poetry -C <repo> run pytest|ruff|mypy|black`.
-  Test the task with `lcpencrypt.run(**kwargs)`, mock `evilflowers_lcpencrypt_worker.run_executable`.
-  246 tests on 2026-11-08. Mocked tests don't catch binary rules: smoke-test inside the image.
+  Test the task with `lcpencrypt.run(**kwargs)`, mock `evilflowers_lcpencrypt_worker.run_executable`;
+  `tests/conftest.py` nulls the delivery counter's Redis client. Real-worker tests (`tests/test_runtime.py`) skip on
+  macOS (prefork spawn bug): run them in `python:3.14-slim-trixie` against host Redis (`TEST_REDIS_URL`,
+  `host.docker.internal:6379/15`). 235 tests on 2026-11-22. Mocked tests don't catch binary rules: smoke-test the image.
 - Memory itself: pages in `.claude/memory/`, contract `.claude/rules/memory.md`, tool
   `tools/memory/memory.py` (copied from the knowledge repo 2026-11-08).
 
