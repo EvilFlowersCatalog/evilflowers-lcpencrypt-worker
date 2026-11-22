@@ -26,5 +26,16 @@ def sample_pdf(tmp_path):
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     """Ensure environment variables don't leak between tests."""
-    for var in ["BROKER", "STORAGE_PATH", "READIUM_LCPENCRYPT_BIN", "LOG_LEVEL"]:
+    for var in ["BROKER", "REDIS_URL", "STORAGE_PATH", "READIUM_LCPENCRYPT_BIN", "MANIFEST_SIDECAR", "MAX_DELIVERIES"]:
         monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_delivery_counter(monkeypatch):
+    """In-process task runs count no deliveries in Redis: every run is the first (`tests/test_deliveries.py` sets
+    its own counter)."""
+    from evilflowers_worker import runtime
+
+    import evilflowers_lcpencrypt_worker  # noqa: F401 - create_app runs on import
+
+    monkeypatch.setattr(runtime.runtime().deliveries, "client", None)

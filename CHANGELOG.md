@@ -54,6 +54,27 @@ This changelog suppose to follow rules defined in the [changelog.md](https://cha
   It is now `BROKER_VISIBILITY_TIMEOUT` (default 12 h, as the catalog and the analyzer); a lost
   encryption is redelivered after up to 12 h
   ([#6](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/6))
+- **Changed**: the Celery runtime is [evilflowers-worker](https://github.com/EvilFlowersCatalog/evilflowers-worker)
+  (its `master`, locked in `poetry.lock`), shared with the other workers on the Redis db; `celery[redis]` floor 5.6
+  ([#8](https://github.com/EvilFlowersCatalog/evilflowers-lcpencrypt-worker/issues/8)):
+  - **Fixed**: a publication that killed the worker was redelivered forever. Past `MAX_DELIVERIES` (5) the task
+    now reports `success: false` (`Gave up after N deliveries …`) to the `report` URL and is dropped
+  - **Fixed**: SIGTERM let a long encryption run into the pod's SIGKILL, and its message came back only after the
+    visibility timeout. Now it gets `WORKER_SOFT_SHUTDOWN_TIMEOUT` (15 s), is cancelled and requeued at once
+    (fallback requeue after `WORKER_CANCEL_TIMEOUT`, 10 s); nothing is reported for it
+  - **Changed**: settings are `Settings(RuntimeSettings)` (`settings.py`); same variables, plus the kit's.
+    `LOG_LEVEL` is gone (Celery's `--loglevel`)
+  - **Changed**: telemetry and logs are the kit's. JSON lines now say `message` (was `msg`), `exception` (was
+    `exc`) and a lower-case `level`, and carry `task_name` and `delivery`. URL credentials stay redacted. The
+    default-gateway collector probe is gone (set `OTEL_EXPORTER_OTLP_ENDPOINT` under Compose);
+    `lcpencrypt.version` moved from the resource to the `lcpencrypt` span. The `lcpencrypt.*` metric names are
+    unchanged
+  - **Changed**: task kwargs are validated; a message without `input_file` is reported `success: false`
+    (`Invalid task message: …`, field names only) and fails at once, without a retry. Validation errors never
+    echo the kwargs (pydantic truncated them mid-URL, past the log redaction)
+  - **Fixed**: a failed run's `error` (reported to the catalog, in task events) is redacted like the logs
+  - **Changed**: the image `HEALTHCHECK` is the kit's liveness file (`evilflowers-worker-alive --max-age 90`)
+  - **Added**: CI runs the real-worker tests (SIGTERM requeue, delivery cap) against a Redis service
 
 ## 0.1.0 - TBD
 

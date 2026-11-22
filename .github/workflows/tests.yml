@@ -15,6 +15,16 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The real-worker tests (`tests/test_runtime.py`: SIGTERM requeue, delivery cap) run a prefork worker against it;
+    # with `CI` set they fail instead of skipping when it is missing.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: [ "6379:6379" ]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      TEST_REDIS_URL: redis://localhost:6379/15
     steps:
       - uses: actions/checkout@v5
 

@@ -7,7 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from evilflowers_lcpencrypt_worker.log_format import redact
+from evilflowers_lcpencrypt_worker.logs import redact
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence

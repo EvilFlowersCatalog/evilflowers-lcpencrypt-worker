@@ -5,7 +5,9 @@ These describe the Celery wire contract with EvilFlowersCatalog
 JSON result. Field names and value types must not change without a matching catalog change.
 """
 
-from typing import Literal, Required, TypedDict
+from typing import Literal, Required, TypedDict, cast
+
+from pydantic import BaseModel, ConfigDict
 
 type StorageMode = Literal[0, 1, 2]
 """How content is stored: 0 = not stored yet, 1 = S3, 2 = file system. Serialized as an int."""
@@ -89,6 +91,52 @@ class LCPEncryptParams(TypedDict, total=False):
     output: str
     login: str
     password: str
+
+
+class LCPEncryptMessage(BaseModel):
+    """`LCPEncryptParams` as the message `runtime.run_task` validates (worker #8).
+
+    Only `input_file` is required. Lenient on purpose: an unknown kwarg is kept (a newer catalog must not fail every
+    task), a number where a string is expected becomes a string, and `None` counts as absent, as `params.get()`
+    treated it before. A message without `input_file` fails at once and is not retried.
+    """
+
+    # `hide_input_in_errors`: the kwargs carry htpasswd credentials, and pydantic's error text truncates the echoed
+    # input mid-URL (`...:password@host`), past what the log redaction can recognise (worker #8).
+    model_config = ConfigDict(extra="allow", coerce_numbers_to_str=True, hide_input_in_errors=True)
+
+    input_file: str
+    storage: str | None = None
+    url: str | None = None
+    contentid: str | None = None
+    filename: str | None = None
+    temp: str | None = None
+    lcpsv: str | None = None
+    notify: str | None = None
+    report: str | None = None
+    verbose: bool | None = None
+    title: str | None = None
+    subtitle: str | None = None
+    author: str | None = None
+    authors: list[str] | None = None
+    translators: list[str] | None = None
+    editors: list[str] | None = None
+    illustrators: list[str] | None = None
+    contributors: list[str] | None = None
+    publisher: str | None = None
+    language: str | list[str] | None = None
+    published: str | None = None
+    description: str | None = None
+    subjects: list[str] | None = None
+    identifier: str | None = None
+    cover: str | None = None
+    output: str | None = None
+    login: str | None = None
+    password: str | None = None
+
+    def params(self) -> LCPEncryptParams:
+        """The task kwargs again, without the absent ones."""
+        return cast("LCPEncryptParams", self.model_dump(exclude_none=True))
 
 
 class LCPEncryptResult(TypedDict):
@@ -202,6 +250,7 @@ class PackagePreviewResult(TypedDict):
 
 __all__ = [
     "EncryptionReport",
+    "LCPEncryptMessage",
     "LCPEncryptParams",
     "LCPEncryptResult",
     "PackagePreviewResult",

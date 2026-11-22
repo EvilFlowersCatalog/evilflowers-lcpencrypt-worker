@@ -18,16 +18,16 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Unpack
+from typing import TYPE_CHECKING, Any, Final, NoReturn, Unpack, cast
 
-from celery import Celery, Task
-from celery.signals import setup_logging, worker_init, worker_process_init, worker_process_shutdown
+from celery.signals import worker_init
+from evilflowers_worker import observability, runtime
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
-from evilflowers_lcpencrypt_worker import telemetry
+from evilflowers_lcpencrypt_worker import logs, telemetry
 from evilflowers_lcpencrypt_worker.helpers import CliValue, ExecutableException, run_executable
-from evilflowers_lcpencrypt_worker.log_format import configure_logging, current_trace_ids
+from evilflowers_lcpencrypt_worker.logs import current_trace_ids
 from evilflowers_lcpencrypt_worker.package import (
     PackageReport,
     PublicationMetadata,
@@ -37,83 +37,52 @@ from evilflowers_lcpencrypt_worker.package import (
     suffix_of,
 )
 from evilflowers_lcpencrypt_worker.report import encryption_report, send_report
+from evilflowers_lcpencrypt_worker.settings import QUEUE, settings
 from evilflowers_lcpencrypt_worker.types import (
+    LCPEncryptMessage,
     LCPEncryptParams,
     LCPEncryptResult,
     PackagePreviewResult,
     StorageMode,
 )
 
+if TYPE_CHECKING:
+    from celery import Celery, Task
+    from pydantic import ValidationError
+
 logger = logging.getLogger(__name__)
 
-QUEUE: Final = "evilflowers_lcpencrypt_worker"
+# -- the app: the kit's runtime (worker #8) ------------------------------------------------
+# `create_app` gives the db's delivery semantics: late ack + requeue on a lost worker, prefetch 1, the db-wide
+# visibility timeout (`BROKER_VISIBILITY_TIMEOUT`, worker #6), the SIGTERM protocol (warm shutdown, cancel and
+# requeue after the grace), the delivery cap (`MAX_DELIVERIES`), task events, the liveness heartbeat, telemetry and
+# JSON logs. The task names are a contract with the catalog, hence the explicit route.
 
-# Matches the catalog's `CELERY_BROKER_VISIBILITY_TIMEOUT` and the analyzer's default (12 h).
-_DEFAULT_VISIBILITY_TIMEOUT: Final = 43200
+_settings = settings()
 
-
-def _visibility_timeout() -> int:
-    """`BROKER_VISIBILITY_TIMEOUT` in seconds (default 12 h).
-
-    Every consumer of a Redis db restores *all* unacked tasks older than its own visibility
-    timeout, in any queue. The dev broker db also carries extraction tasks that run for hours
-    (EvilFlowersCatalog#120), so this must not be shorter than theirs (worker #6).
-    """
-    return int(os.getenv("BROKER_VISIBILITY_TIMEOUT", str(_DEFAULT_VISIBILITY_TIMEOUT)))
-
-
-app = Celery("evilflowers_lcpencrypt_worker", broker=os.getenv("BROKER", "redis://localhost:6379/7"))
-app.conf.update(
-    broker_connection_retry_on_startup=True,
-    task_track_started=True,
-    task_serializer="json",
-    result_serializer="json",
-    accept_content=["json"],
-    # One long-running subprocess per task: never reserve a second message behind it.
-    worker_prefetch_multiplier=1,
-    broker_transport_options={"visibility_timeout": _visibility_timeout()},
+# Typed here: the kit ships no py.typed, and an `Any` app would make every task decorator untyped.
+app: Celery = runtime.create_app(
+    "lcpencrypt",
+    _settings,
+    include=[],
+    queues=[_settings.queue],
+    routes={"evilflowers_lcpencrypt_worker.*": _settings.queue},
+    attributes={**observability.CATALOG_JOB_ATTRIBUTES, "content_id": "lcp.content_id"},
 )
+# After `create_app`: wraps the formatter the kit's receiver sets.
+logs.install()
 
 
-# -- logging and telemetry ----------------------------------------------------------
-
-
-@setup_logging.connect
-def _configure_logging(loglevel: str | int | None = None, **_: Any) -> None:
-    """Celery configures no logging of its own when this signal has a receiver.
-
-    The worker, its pool children and the task code then log through one handler: JSON lines
-    with `level` and `trace_id` (`LOG_FORMAT=json`, the container default) or plain text.
-    """
-    configure_logging(loglevel)
+@worker_init.connect
+def _setup_telemetry_without_pool(sender: object = None, **_: Any) -> None:
+    """With a non-forking pool (solo, threads) `worker_process_init` never fires: set up in this process."""
+    if sender is not None and not _is_prefork(sender):
+        observability.setup()
 
 
 def _is_prefork(worker: object) -> bool:
     pool = getattr(worker, "pool_cls", None)
     return "prefork" in f"{getattr(pool, '__module__', '')}.{getattr(pool, '__name__', pool)}"
-
-
-@worker_init.connect
-def _discover_collector(sender: object = None, **_: Any) -> None:
-    """Main process: look for the collector once, before the pool forks.
-
-    Children inherit the verdict through the environment. With a non-forking pool (solo,
-    threads) the tasks run in this process, so it is the one to set up.
-    """
-    telemetry.discover_endpoint()
-    if sender is not None and not _is_prefork(sender):
-        telemetry.setup()
-
-
-@worker_process_init.connect
-def _setup_telemetry_in_child(**_: Any) -> None:
-    telemetry.setup()
-
-
-@worker_process_shutdown.connect
-def _flush_telemetry_in_child(**_: Any) -> None:
-    # Prefork children leave through `os._exit()`, which skips `atexit`.
-    telemetry.shutdown()
 
 
 # -- helpers ------------------------------------------------------------------------
@@ -220,7 +189,7 @@ def _content_key(stdout: str) -> str:
 
 def _sidecar_enabled() -> bool:
     """`MANIFEST_SIDECAR` (default on): write `{filename}.manifest.json` next to the package."""
-    return os.getenv("MANIFEST_SIDECAR", "true").strip().lower() not in ("0", "false", "no", "off")
+    return settings().manifest_sidecar
 
 
 def _local_storage_dir(storage: str | None, storage_path: str) -> Path | None:
@@ -242,20 +211,18 @@ class _Outcome:
     manifest_path: str | None = None
 
 
-@app.task(
-    bind=True,
-    name="evilflowers_lcpencrypt_worker.lcpencrypt",
-    queue=QUEUE,
-    acks_late=True,
-    reject_on_worker_lost=True,
-)
+@app.task(bind=True, name="evilflowers_lcpencrypt_worker.lcpencrypt", queue=QUEUE, **runtime.JOB_TASK_OPTIONS)
 # `Task[...]` is generic only in the celery-types stubs; Celery reads `__annotations__` when it
 # builds the task, so the subscripted form must stay a string at runtime.
 def lcpencrypt(
     self: "Task[Any, LCPEncryptResult]",  # noqa: UP037 - must not be evaluated at runtime, see above
-    **params: Unpack[LCPEncryptParams],
+    **kwargs: Any,
 ) -> LCPEncryptResult:
     """Encrypt a publication with Readium LCP.
+
+    The kwargs are `LCPEncryptParams`. The body runs through the kit's `runtime.run_task`: the message is validated
+    (no `input_file`: the task fails at once and is not retried), the delivery counted, and past `MAX_DELIVERIES`
+    (the publication killed the worker every time) `_give_up` reports a failure instead of running lcpencrypt again.
 
     Supported formats: EPUB 2/3, PDF, Readium Packages (audiobooks, DIVINA, …), W3C Audiobooks
     packaged as LPF. Parameters are described in `LCPEncryptParams`.
@@ -280,38 +247,118 @@ def lcpencrypt(
     Example:
         >>> lcpencrypt.delay(input_file="book.epub", storage="s3:eu-west-3:lcp", contentid="book-123")
     """
-    input_file = params["input_file"]
-    contentid = params.get("contentid")
-    input_format = _input_format(input_file)
-    log_extra = {"content_id": contentid, "task_id": self.request.id}
+    task_id = self.request.id
 
-    logger.info("Starting LCP encryption for %s", input_file, extra=log_extra)
+    def run(message: LCPEncryptMessage, delivery: int) -> LCPEncryptResult:
+        return _run(message.params(), task_id, delivery)
 
+    def give_up(message: LCPEncryptMessage, delivery: int) -> NoReturn:
+        _give_up(message.params(), task_id, delivery)
+
+    def invalid(raw: dict[str, Any], error: ValidationError) -> NoReturn:
+        _invalid(raw, error, task_id)
+
+    return cast(
+        "LCPEncryptResult",
+        runtime.run_task(self, run, LCPEncryptMessage, kwargs, on_capped=give_up, on_invalid=invalid),
+    )
+
+
+def _invalid(raw: dict[str, Any], error: ValidationError, task_id: str | None) -> NoReturn:
+    """A message that does not validate: report `success: false` when it has a `report` URL, then raise.
+
+    Every outcome reaches the catalog (#3), this one included; the raise fails the task at once, without a retry.
+    The reason names the fields only, never their values (the kwargs carry credentials).
+    """
+    reason = "Invalid task message: " + "; ".join(
+        f"{'.'.join(str(part) for part in item['loc']) or 'message'}: {item['msg']}" for item in error.errors()
+    )
+    if isinstance(url := raw.get("report"), str) and url:
+        contentid = raw.get("contentid") if isinstance(raw.get("contentid"), str) else None
+        result = LCPEncryptResult(
+            content_id=contentid or "unknown",
+            content_encryption_key="",
+            storage_mode=0,
+            protected_content_location="",
+            protected_content_disposition="",
+            protected_content_type="",
+            protected_content_length=0,
+            protected_content_sha256="",
+            success=False,
+            error=reason,
+        )
+        try:
+            trace_id, _ = current_trace_ids()
+            payload = encryption_report(
+                result, contentid=contentid, task_id=task_id, trace_id=trace_id, package=None, manifest_path=None
+            )
+            send_report(url, payload)
+        except Exception as report_error:  # noqa: BLE001 - a report must not replace the validation error
+            logger.warning("Reporting the invalid message of %s failed: %r", task_id, report_error)
+    raise error
+
+
+def _task_span(params: LCPEncryptParams, delivery: int) -> Any:
+    """The `lcpencrypt` span of one delivery."""
     tracer = trace.get_tracer(telemetry.INSTRUMENTATION_SCOPE, telemetry.service_version())
-    with tracer.start_as_current_span(
+    return tracer.start_as_current_span(
         "lcpencrypt",
         attributes={
-            "lcp.content_id": contentid or "",
-            "lcp.input.format": input_format,
+            "lcp.content_id": params.get("contentid") or "",
+            "lcp.input.format": _input_format(params["input_file"]),
             "lcp.storage_mode": _determine_storage_mode(params.get("storage")),
             "lcp.metadata.injected": False,
+            "lcpencrypt.version": telemetry.lcpencrypt_version(),
+            "evilflowers.job.delivery": delivery,
         },
         record_exception=False,
         set_status_on_exception=False,
-    ) as span:
+    )
+
+
+def _run(params: LCPEncryptParams, task_id: str | None, delivery: int) -> LCPEncryptResult:
+    """One delivery of the task: encrypt, then report the outcome."""
+    input_file = params["input_file"]
+    contentid = params.get("contentid")
+
+    # `content_id` on every log line of the run (the kit's JSON lines carry bound fields, not `extra=`).
+    with observability.bind(content_id=contentid), _task_span(params, delivery) as span:
+        logger.info("Starting LCP encryption for %s (delivery %d)", input_file, delivery)
         try:
-            outcome = _encrypt(params, log_extra=log_extra, span=span)
+            outcome = _encrypt(params, span=span)
         except Exception as error:
             # A bug, not an lcpencrypt failure: still tell the catalog, then let Celery see it.
             span.record_exception(error)
             span.set_status(Status(StatusCode.ERROR, type(error).__name__))
-            _report(params, self.request.id, _Outcome(_failed(params, f"Worker error: {error!r}")))
+            _report(params, task_id, _Outcome(_failed(params, f"Worker error: {error!r}")))
             raise
-        _report(params, self.request.id, outcome)
+        _report(params, task_id, outcome)
         return outcome.result
 
 
-def _encrypt(params: LCPEncryptParams, *, log_extra: dict[str, Any], span: trace.Span) -> _Outcome:
+class DeliveriesExhausted(RuntimeError):
+    """The message was delivered past `MAX_DELIVERIES` times: the run killed the worker every time."""
+
+
+def _give_up(params: LCPEncryptParams, task_id: str | None, delivery: int) -> NoReturn:
+    """Past the delivery cap: report `success: false` through the `report` URL, then raise (worker #8).
+
+    lcpencrypt is not run again. The raise fails the task, so the message is acknowledged and never redelivered.
+    """
+    input_file = params["input_file"]
+    error = (
+        f"Gave up after {delivery - 1} deliveries: the worker died or was stopped during each of them "
+        "(the publication may crash or exhaust the worker)"
+    )
+    with observability.bind(content_id=params.get("contentid")), _task_span(params, delivery) as span:
+        _record(span, _input_format(input_file), "gave_up", 0.0)
+        span.set_status(Status(StatusCode.ERROR, "delivery cap"))
+        logger.error("LCP encryption of %s given up: %s", input_file, error)
+        _report(params, task_id, _Outcome(_failed(params, error)))
+    raise DeliveriesExhausted(error)
+
+
+def _encrypt(params: LCPEncryptParams, *, span: trace.Span) -> _Outcome:
     """Run lcpencrypt for one task; every return is an outcome the catalog can be told about."""
     input_file = params["input_file"]
     storage = params.get("storage")
@@ -321,15 +368,16 @@ def _encrypt(params: LCPEncryptParams, *, log_extra: dict[str, Any], span: trace
     temp = params.get("temp", "/tmp")  # noqa: S108 - lcpencrypt's own default, overridable per task
     output = params.get("output")
 
-    storage_path = os.getenv("STORAGE_PATH", "/mnt/data")
-    lcpencrypt_bin = os.getenv("READIUM_LCPENCRYPT_BIN", "lcpencrypt")
+    current = settings()
+    storage_path = str(current.storage_path)
+    lcpencrypt_bin = current.readium_lcpencrypt_bin
     input_format = _input_format(input_file)
 
     if storage and not url:
         # lcpencrypt (v1.13.4+) exits with "storage requires url"; say so without running it.
         _record(span, input_format, "failure", 0.0)
         span.set_status(Status(StatusCode.ERROR, "storage requires url"))
-        logger.error("LCP encryption refused for %s: storage requires url", input_file, extra=log_extra)
+        logger.error("LCP encryption refused for %s: storage requires url", input_file)
         return _Outcome(_failed(params, "Invalid parameters: storage requires url"))
 
     resolved_input = _resolve(input_file, storage_path)
@@ -377,11 +425,13 @@ def _encrypt(params: LCPEncryptParams, *, log_extra: dict[str, Any], span: trace
         span.record_exception(error)
         span.set_status(Status(StatusCode.ERROR, f"lcpencrypt exited with {error.returncode}"))
         # `error`, not `exception`: a Python traceback adds nothing to lcpencrypt's own stderr.
+        # lcpencrypt's own output in the line: the kit's JSON lines carry bound fields only, not `extra=`.
         logger.error(
-            "LCP encryption failed for %s: %s",
+            "LCP encryption failed for %s: %s\nstdout: %s\nstderr: %s",
             input_file,
             error,
-            extra={**log_extra, "returncode": error.returncode, "stderr": error.stderr, "stdout": error.stdout},
+            (error.stdout or "").strip(),
+            (error.stderr or "").strip(),
         )
         reason = _failure_reason(error)
         message = f"Encryption failed: {error}" + (f": {reason}" if reason else "")
@@ -396,17 +446,12 @@ def _encrypt(params: LCPEncryptParams, *, log_extra: dict[str, Any], span: trace
         # Exit 0, yet lcpencrypt took the content back off the License Server: not lendable.
         _record(span, input_format, "failure", time.perf_counter() - started)
         span.set_status(Status(StatusCode.ERROR, "CMS notification failed"))
-        logger.error(
-            "LCP encryption of %s withdrawn: %s",
-            input_file,
-            cms_error,
-            extra={**log_extra, "stdout": result.stdout},
-        )
+        logger.error("LCP encryption of %s withdrawn: %s\nstdout: %s", input_file, cms_error, result.stdout.strip())
         message = f"Encryption withdrawn from the License Server: {cms_error}"
         return _Outcome(_failed(params, message), package)
 
     _record(span, input_format, "success", time.perf_counter() - started)
-    logger.info("LCP encryption completed for %s", input_file, extra=log_extra)
+    logger.info("LCP encryption completed for %s", input_file)
     logger.debug("lcpencrypt output: %s", result.stdout)
 
     output_filename = filename or contentid or Path(input_file).stem
@@ -426,7 +471,7 @@ def _encrypt(params: LCPEncryptParams, *, log_extra: dict[str, Any], span: trace
         # `found` is `local_file_path` plus the extension lcpencrypt appended (`.lcpdf`, `.epub`, …).
         output_location += found.removeprefix(local_file_path)
         mime_type, file_size, file_hash = _get_file_info(found)
-        telemetry.protected_content_size().record(file_size, {"lcp.input.format": input_format})
+        telemetry.PROTECTED_CONTENT_SIZE.record(file_size, {"lcp.input.format": input_format})
         span.set_attribute("lcp.protected_content.size", file_size)
 
     manifest_path = _write_manifest_sidecar(package, storage, storage_path, output_filename, span)
@@ -568,7 +613,7 @@ def _report(params: LCPEncryptParams, task_id: str | None, outcome: _Outcome) ->
         )
         send_report(url, payload)
     except Exception as error:  # noqa: BLE001 - a report must not change the task's outcome
-        logger.warning("Reporting the task outcome failed: %r", error, extra={"task_id": task_id})
+        logger.warning("Reporting the task outcome of %s failed: %r", task_id, error)
 
 
 @app.task(bind=True, name="evilflowers_lcpencrypt_worker.package_preview", queue=QUEUE)
@@ -586,10 +631,9 @@ def package_preview(
     input_file = params["input_file"]
     contentid = params.get("contentid")
     filename = params.get("filename") or contentid or Path(input_file).stem
-    storage_path = os.getenv("STORAGE_PATH", "/mnt/data")
+    storage_path = str(settings().storage_path)
     temp = params.get("temp", "/tmp")  # noqa: S108 - as in lcpencrypt
     resolved_input = _resolve(input_file, storage_path)
-    log_extra = {"content_id": contentid, "task_id": self.request.id}
 
     if not _looks_like_pdf(resolved_input):
         return _preview_failed("package preview supports PDF input only (EPUB carries its own metadata)")
@@ -616,7 +660,7 @@ def package_preview(
         except Exception as error:  # noqa: BLE001 - a preview reports, it does not crash the worker
             span.record_exception(error)
             span.set_status(Status(StatusCode.ERROR, type(error).__name__))
-            logger.warning("Package preview failed for %s: %s", input_file, error, extra=log_extra)
+            logger.warning("Package preview failed for %s (content %s): %s", input_file, contentid, error)
             return _preview_failed(f"Package preview failed: {error}")
 
         report = preview.report
@@ -651,7 +695,6 @@ def package_preview(
             report.cover,
             report.page_count,
             report.toc_entries,
-            extra=log_extra,
         )
         return PackagePreviewResult(
             success=True,
@@ -693,14 +736,15 @@ def _failed(params: LCPEncryptParams, error: str) -> LCPEncryptResult:
         protected_content_length=0,
         protected_content_sha256="",
         success=False,
-        error=error,
+        # lcpencrypt's output can echo the -lcpsv/-notify URLs; the error is stored by the catalog and in task events.
+        error=logs.redact(error),
     )
 
 
 def _record(span: trace.Span, input_format: str, outcome: str, seconds: float) -> None:
     attributes = {"lcp.input.format": input_format, "lcp.outcome": outcome}
-    telemetry.encryption_duration().record(seconds, attributes)
-    telemetry.encryptions().add(1, attributes)
+    telemetry.ENCRYPTION_DURATION.record(seconds, attributes)
+    telemetry.ENCRYPTIONS.add(1, attributes)
     span.set_attribute("lcp.outcome", outcome)
 
 

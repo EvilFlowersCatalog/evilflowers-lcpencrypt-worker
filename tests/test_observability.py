@@ -5,6 +5,8 @@ import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
+from evilflowers_worker import observability
+from evilflowers_worker.observability import JsonFormatter
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -15,7 +17,7 @@ from opentelemetry.trace import StatusCode
 
 from evilflowers_lcpencrypt_worker import _is_prefork, lcpencrypt
 from evilflowers_lcpencrypt_worker.helpers import ExecutableException, ExecutableResult, run_executable
-from evilflowers_lcpencrypt_worker.log_format import JsonFormatter, TextFormatter, configure_logging, log_format
+from evilflowers_lcpencrypt_worker.logs import RedactingFormatter, redact
 
 _SPANS = InMemorySpanExporter()
 _METRICS = InMemoryMetricReader()
@@ -237,84 +239,56 @@ class TestFailureReason:
 
 
 class TestJsonLogs:
-    def _record(self, msg: str = "hello", **extra: object) -> logging.LogRecord:
-        record = logging.LogRecord("evilflowers_lcpencrypt_worker", logging.INFO, __file__, 1, msg, (), None)
-        record.__dict__.update(extra)
-        return record
+    """The kit's JSON lines (evilflowers-worker `observability.logs`), wrapped by `RedactingFormatter`."""
 
-    def test_shape(self):
-        line = json.loads(JsonFormatter().format(self._record(content_id="cid")))
-        assert line["level"] == "INFO"
+    def _record(self, msg: str = "hello") -> logging.LogRecord:
+        return logging.LogRecord("evilflowers_lcpencrypt_worker", logging.INFO, __file__, 1, msg, (), None)
+
+    def test_shape_with_bound_content_id(self):
+        with observability.bind(content_id="cid"):
+            line = json.loads(RedactingFormatter(JsonFormatter()).format(self._record()))
+        assert line["level"] == "info"
         assert line["logger"] == "evilflowers_lcpencrypt_worker"
-        assert line["msg"] == "hello"
-        assert line["time"].endswith("Z")
+        assert line["message"] == "hello"
         assert line["content_id"] == "cid"
         assert "trace_id" not in line
 
     def test_trace_id_inside_span(self):
         with trace.get_tracer("test").start_as_current_span("s") as span:
-            line = json.loads(JsonFormatter().format(self._record()))
+            line = json.loads(RedactingFormatter(JsonFormatter()).format(self._record()))
             expected = trace.format_trace_id(span.get_span_context().trace_id)
         assert line["trace_id"] == expected
         assert len(line["span_id"]) == 16
 
-    def test_extra_never_overwrites_alloy_fields(self):
-        line = json.loads(JsonFormatter().format(self._record(level="DEBUG")))
-        assert line["level"] == "INFO"
+    def test_content_id_is_a_span_attribute(self, spans):
+        with trace.get_tracer("test").start_as_current_span("s"), observability.bind(content_id="cid"):
+            pass
+        (span,) = spans.get_finished_spans()
+        assert span.attributes["lcp.content_id"] == "cid"
 
-    def test_exception_is_serialized(self):
+    @pytest.mark.parametrize(("log_format", "inner"), [("json", JsonFormatter), ("text", logging.Formatter)])
+    def test_celery_logger_signal_wraps_the_kits_formatter(self, log_format, inner):
+        """Celery sends `after_setup_logger` at worker start: the kit sets JSON, then ours wraps it."""
+        import importlib
+
+        from celery.signals import after_setup_logger
+
+        # The module, not the `identity()` function the package re-exports under the same name.
+        identity = importlib.import_module("evilflowers_worker.observability.identity")
+        saved = identity.identity()
+        logger = logging.getLogger("test.after_setup_logger")
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter())
+        logger.addHandler(handler)
         try:
-            raise ValueError("bad")
-        except ValueError:
-            import sys
-
-            record = logging.LogRecord("x", logging.ERROR, __file__, 1, "failed", (), sys.exc_info())
-        line = json.loads(JsonFormatter().format(record))
-        assert "ValueError: bad" in line["exc"]
-
-    def test_text_formatter_appends_trace_id(self):
-        with trace.get_tracer("test").start_as_current_span("s"):
-            line = TextFormatter().format(self._record())
-        assert "trace_id=" in line
-
-    @pytest.mark.parametrize(
-        ("value", "expected"), [(None, "text"), ("json", "json"), ("JSON", "json"), ("x", "text")]
-    )
-    def test_log_format_env(self, monkeypatch, value, expected):
-        if value is None:
-            monkeypatch.delenv("LOG_FORMAT", raising=False)
-        else:
-            monkeypatch.setenv("LOG_FORMAT", value)
-        assert log_format() == expected
-
-    # Celery's setup_logging signal passes an int; LOG_LEVEL / the CLI pass a name.
-    @pytest.mark.parametrize(("level", "expected"), [("warning", logging.WARNING), (logging.DEBUG, logging.DEBUG)])
-    def test_configure_logging_installs_json_handler(self, monkeypatch, level, expected):
-        monkeypatch.setenv("LOG_FORMAT", "json")
-        root = logging.getLogger()
-        saved_handlers, saved_level = root.handlers[:], root.level
-        try:
-            configure_logging(level)
-            assert root.level == expected
-            assert isinstance(root.handlers[0].formatter, JsonFormatter)
+            identity.configure(saved.service, log_format=log_format, attributes=saved.attributes)
+            after_setup_logger.send(sender=None, logger=logger, loglevel=logging.INFO, logfile=None, format="")
+            after_setup_logger.send(sender=None, logger=logger, loglevel=logging.INFO, logfile=None, format="")
+            assert isinstance(handler.formatter, RedactingFormatter)
+            assert type(handler.formatter.inner) is inner  # wrapped once, not twice
         finally:
-            root.handlers[:] = saved_handlers
-            root.setLevel(saved_level)
-
-    def test_celery_setup_logging_signal(self, monkeypatch):
-        """The receiver Celery calls at worker start; it passes loglevel=logging.INFO."""
-        from celery.signals import setup_logging
-
-        monkeypatch.setenv("LOG_FORMAT", "json")
-        root = logging.getLogger()
-        saved_handlers, saved_level = root.handlers[:], root.level
-        try:
-            setup_logging.send(sender=None, loglevel=logging.INFO, logfile=None, format="", colorize=False)
-            assert root.level == logging.INFO
-            assert isinstance(root.handlers[0].formatter, JsonFormatter)
-        finally:
-            root.handlers[:] = saved_handlers
-            root.setLevel(saved_level)
+            identity._identity = saved
+            logger.removeHandler(handler)
 
 
 class TestLogRedaction:
@@ -323,7 +297,7 @@ class TestLogRedaction:
     KWARGS = "{'lcpsv': 'http://lcpuser:Hunter2pw@readium.svc:8989', 'notify': 'http://u:p@cms/hook'}"
 
     def _celery_like_record(self) -> logging.LogRecord:
-        record = logging.LogRecord(
+        return logging.LogRecord(
             "celery.worker.strategy",
             logging.INFO,
             __file__,
@@ -332,10 +306,12 @@ class TestLogRedaction:
             ("evilflowers_lcpencrypt_worker.lcpencrypt[id]", self.KWARGS),
             None,
         )
-        record.data = {"id": "id", "kwargs": self.KWARGS}
-        return record
 
-    @pytest.mark.parametrize("formatter", [JsonFormatter(), TextFormatter()], ids=["json", "text"])
+    @pytest.mark.parametrize(
+        "formatter",
+        [RedactingFormatter(JsonFormatter()), RedactingFormatter(logging.Formatter("%(levelname)s %(message)s"))],
+        ids=["json", "text"],
+    )
     def test_credentials_never_reach_the_line(self, formatter):
         line = formatter.format(self._celery_like_record())
         assert "Hunter2pw" not in line
@@ -343,18 +319,25 @@ class TestLogRedaction:
         assert "u:p@" not in line
         assert "***:***@readium.svc:8989" in line
 
-    def test_json_stays_valid_and_keeps_the_extra(self):
-        line = json.loads(JsonFormatter().format(self._celery_like_record()))
-        assert "http://***:***@readium.svc:8989" in line["data"]["kwargs"]
-        assert "http://***:***@readium.svc:8989" in line["msg"]
+    def test_json_stays_valid(self):
+        line = json.loads(RedactingFormatter(JsonFormatter()).format(self._celery_like_record()))
+        assert "http://***:***@readium.svc:8989" in line["message"]
+
+    def test_exception_text_is_redacted(self):
+        try:
+            raise OSError("cannot reach http://u:secret@catalog/hook")
+        except OSError:
+            import sys
+
+            record = logging.LogRecord("x", logging.ERROR, __file__, 1, "failed", (), sys.exc_info())
+        line = json.loads(RedactingFormatter(JsonFormatter()).format(record))
+        assert "secret" not in line["exception"]
 
     @pytest.mark.parametrize(
         "text",
         ["https://example.com/a@b", "mailto:someone@example.com", "redis://lcp-redis:6379/7", "s3:eu-west-3:bucket"],
     )
     def test_urls_without_credentials_are_untouched(self, text):
-        from evilflowers_lcpencrypt_worker.log_format import redact
-
         assert redact(text) == text
 
 

@@ -311,35 +311,61 @@ What a reading app will show can be checked without borrowing the publication:
 
 | Variable                      | Description                                        | Default                    | Example                                   |
 |-------------------------------|----------------------------------------------------|----------------------------|-------------------------------------------|
-| `BROKER`                      | Celery broker URL                                  | `redis://localhost:6379/7` | `redis://redis:6379/7`                    |
+| `BROKER`                      | Celery broker URL (the kit's `REDIS_URL` works too) | `redis://localhost:6379/7` | `redis://redis:6379/7`                   |
 | `BROKER_VISIBILITY_TIMEOUT`   | Redis `visibility_timeout` (s); not shorter than any other consumer's on the same db | `43200` | `43200`                  |
-| `LOG_LEVEL`                   | Logging level                                      | `INFO`                     | `DEBUG`                                   |
+| `MAX_DELIVERIES`              | Deliveries of one message before it is given up and reported failed; `0` = no cap | `5` | `5`                |
+| `WORKER_SOFT_SHUTDOWN_TIMEOUT`| SIGTERM: seconds the running encryption may go on before it is cancelled and requeued | `15` | `15`            |
+| `WORKER_CANCEL_TIMEOUT`       | Seconds the cancel may take before the worker requeues the message itself and exits | `10` | `10`              |
+| `WORKER_HEARTBEAT_FILE`       | Liveness file the worker touches every 30 s (`evilflowers-worker-alive --max-age 90`) | `/tmp/evilflowers-worker.heartbeat` | - |
 | `LOG_FORMAT`                  | `json` (one object per line) or `text`             | `text` (image: `json`)     | `json`                                    |
+| `IMAGE_TAG`                   | `service.version` (CI builds it in)                | `dev`                      | `develop`                                 |
 | `STORAGE_PATH`                | Base path for file storage                         | `/mnt/data`                | `/var/local/evilflowers`                  |
 | `READIUM_LCPENCRYPT_BIN`      | Path to `lcpencrypt` binary                        | `lcpencrypt`               | `/usr/local/bin/lcpencrypt`               |
 | `CELERY_HOSTNAME`             | Celery node name (image entrypoint and health check) | `lcpencrypt@%h`          | `lcpencrypt@dev`                          |
 | `MANIFEST_SIDECAR`            | Write `{filename}.manifest.json` next to the package | `true`                   | `false`                                   |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector                                | discovered (see below)     | `http://$(HOST_IP):4318`                  |
-| `HOST_IP`                     | Node IP (k8s downward API), probed on `:4318`      | -                          | `status.hostIP`                           |
-| `OTEL_SERVICE_NAME`           | `service.name` in traces/metrics                   | `lcpencrypt`               | `lcpencrypt`                              |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP collector                                | from `HOST_IP`, else off   | `http://$(HOST_IP):4318`                  |
+| `HOST_IP`                     | Node IP (k8s downward API): endpoint `http://$HOST_IP:4318` | -                 | `status.hostIP`                           |
+| `OTEL_SERVICE_NAME`           | `service.name` in traces/metrics                   | image: `lcpencrypt`        | `lcpencrypt`                              |
+| `PYROSCOPE_SERVER_ADDRESS`    | Pyroscope SDK profiles (off without it)            | -                          | -                                         |
 | `OTEL_RESOURCE_ATTRIBUTES`    | Extra resource attributes                          | -                          | `deployment.environment.name=development` |
 | `OTEL_SDK_DISABLED`           | `true` turns telemetry off                         | -                          | `true`                                    |
 
-Any other standard `OTEL_*` variable (`OTEL_TRACES_EXPORTER=console`, `OTEL_METRIC_EXPORT_INTERVAL`, …)
+Celery's log level is its `--loglevel` (`CELERY_LOG_LEVEL` in the image); `LOG_LEVEL` is gone.
+Any other standard `OTEL_*` variable (`OTEL_TRACES_SAMPLER`, `OTEL_METRIC_EXPORT_INTERVAL`, …)
 is honoured by the SDK.
+
+## Runtime: delivery, shutdown, liveness
+
+The Celery side is [evilflowers-worker](https://github.com/EvilFlowersCatalog/evilflowers-worker) (its
+`master`; `poetry.lock` records the commit, `poetry update evilflowers-worker` moves it), the runtime the other workers on the shared Redis db use (issue #8):
+
+![Delivery cap and SIGTERM](docs/diagrams/sequence-delivery-and-shutdown.svg)
+
+- **Delivery**: late acknowledgement, requeue when the pool child dies, prefetch 1, the db-wide visibility
+  timeout. A publication that kills the worker every time (an OOM, a crash in lcpencrypt) is no longer
+  redelivered forever: past `MAX_DELIVERIES` the task reports `success: false` to the `report` URL
+  (`Gave up after N deliveries …`), raises, and the message is dropped.
+- **SIGTERM** (rollout, scale-in): warm shutdown. The running encryption has `WORKER_SOFT_SHUTDOWN_TIMEOUT`
+  to finish; then it is cancelled and its message goes back on the queue at once, not after the 12 h visibility
+  timeout. Nothing is reported for a requeued run, and it does not count towards the cap. 15 + 10 s fit the pod's
+  default 30 s grace; raise all three together. Never set `REMAP_SIGTERM`.
+- **Liveness**: `evilflowers-worker-alive --max-age 90` (the image's `HEALTHCHECK`; usable as a k8s exec probe).
+- **Messages**: kwargs are validated (`LCPEncryptMessage`): no `input_file` fails the task at once, without a retry.
+  Unknown kwargs are kept, so a newer catalog does not break the worker.
 
 ## Observability
 
-Same contract as the catalog (EvilFlowersCatalog IP-019) and the ELVIRA *Deploy a service* cookbook.
-The SDK is the `observability` extra (installed in the image); without it every call is a no-op.
+Same contract as the catalog (EvilFlowersCatalog IP-019) and the ELVIRA *Deploy a service* cookbook, through
+the kit's `observability` package. The SDK is the `observability` extra (the kit's `otel`, installed in the
+image); without it every call is a no-op.
 
-- **Collector**: OTLP/HTTP. Endpoint precedence: `OTEL_EXPORTER_OTLP_ENDPOINT` → `HOST_IP:4318`
-  → the container's default gateway `:4318` (Docker bridge → host Alloy). Nothing answering = off,
-  logged once; no exporter retrying against localhost.
+- **Collector**: OTLP/HTTP. `OTEL_EXPORTER_OTLP_ENDPOINT`, else `http://$HOST_IP:4318`; with neither,
+  telemetry is off. The old default-gateway probe is gone: under Docker Compose set the endpoint explicitly.
 - **Traces**: `CeleryInstrumentor` continues the catalog's trace from the task headers:
   `catalog → apply_async (producer) → run (consumer) → lcpencrypt`. The `lcpencrypt` span carries
-  `lcp.content_id`, `lcp.input.format`, `lcp.storage_mode`, `lcp.metadata.injected`, `lcp.outcome`,
-  `process.exit.code`, `lcp.protected_content.size`; for a built PDF package also
+  `lcp.content_id`, `lcp.input.format`, `lcp.storage_mode`, `lcp.metadata.injected`, `lcp.outcome`
+  (`success`, `failure`, `gave_up`), `process.exit.code`, `lcp.protected_content.size`, `lcpencrypt.version`
+  (was a resource attribute), `evilflowers.job.delivery`; for a built PDF package also
   `lcp.package.cover|pages|toc_entries|manifest_path` and the `lcp.package.manifest` event. A failed
   run (or a publication lcpencrypt withdrew after a failed `notify`) sets status `ERROR`. The
   outcome report is a child `POST` client span whose `traceparent` the catalog continues.
@@ -347,12 +373,13 @@ The SDK is the `observability` extra (installed in the image); without it every 
   The broker's Redis traffic is deliberately not traced (it would be one orphan root span per poll).
 - **Metrics**: `lcpencrypt.encryption.duration` (s, histogram), `lcpencrypt.encryptions` (counter),
   `lcpencrypt.protected_content.size` (By), all by `lcp.input.format` / `lcp.outcome`; plus
-  per-process `process.*` (CPU, memory, threads, fds) to tell prefork children apart.
+  the kit's `lcpencrypt.task.duration` and `lcpencrypt.deliveries.capped`, and per-process `process.*`.
 - **Logs**: not exported over OTLP. Alloy tails stdout; with `LOG_FORMAT=json` every line has
-  `level`, `logger`, `msg`, and inside a task `trace_id`/`span_id`, `content_id`, `task_id`.
-  URL credentials (`-lcpsv`, `-notify`, `report`) are redacted from every log line.
-- **Process model**: the collector is discovered once in the main process (`worker_init`), the SDK
-  is set up in each prefork child (`worker_process_init`) and flushed on `worker_process_shutdown`.
+  `time`, `level` (lower case), `logger`, `message`, `exception`, and inside a task `trace_id`/`span_id`,
+  `task_name`, `task_id`, `content_id`, `delivery`. URL credentials (`-lcpsv`, `-notify`, `report`) are redacted
+  from every line (`logs.py`, on top of the kit's formatter).
+- **Process model**: the SDK is set up in each prefork child (`worker_process_init`; in the worker process
+  itself with a solo/threads pool) and flushed on shutdown.
 
 In Grafana: Tempo `{resource.service.name="lcpencrypt"}`, Loki `{service_name="lcpencrypt"} | json`.
 In k8s the pod should carry `elvira.stuba.sk/instrumentation: otel-sdk` so Beyla does not trace it twice.
@@ -459,8 +486,9 @@ Note: lcpencrypt requires `url` whenever `storage` is given (`storage requires u
 evilflowers_lcpencrypt_worker/
 ├── __init__.py          # Celery app, signal wiring, the lcpencrypt and package_preview tasks
 ├── __main__.py          # CLI entry point for starting worker
-├── telemetry.py         # OpenTelemetry setup (collector discovery, providers, instruments)
-├── log_format.py        # JSON / text log formatting with trace ids
+├── settings.py          # Settings(RuntimeSettings): the kit's runtime settings + lcpencrypt's own
+├── telemetry.py         # lcpencrypt.* instruments (providers and setup are the kit's)
+├── logs.py              # URL-credential redaction over the kit's log format
 ├── types.py             # TypedDict wire contract with the catalog
 ├── package.py           # Readium package for raw PDFs: metadata, cover, page count, toc
 ├── preview.py           # python -m …preview: the package for a PDF, without encrypting
