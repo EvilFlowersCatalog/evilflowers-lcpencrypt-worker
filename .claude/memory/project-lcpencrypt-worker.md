@@ -6,7 +6,7 @@ metadata:
   type: project
   verified: 2026-11-08
   originSessionId: 0c064b23-8064-4a5f-9bbb-5e6b4a4211ed
-  modified: 2026-11-22T00:49:26.906Z
+  modified: 2026-11-22T00:56:02.212Z
 ---
 
 - Catalog (`apps/readium/services/content_encryption_service.py`, develop) sends `input_file`,
@@ -44,7 +44,10 @@ metadata:
   `REDIS_URL`, `evilflowers_lcpencrypt_worker/settings.py` aliases `BROKER` first; pod grace is the k8s default
   30 s, so shutdown is 15 + 10 s; the kit's formatter drops `extra=` (use `observability.bind`), `logs.py` wraps it
   for redaction; the kit has no py.typed (mypy override, `app: Celery` annotation); the Dockerfile builds the
-  git dep as a wheel (`--require-hashes` refuses VCS lines). Role follow-up: knowledge#103 → PR knowledge#104 (comment + explicit 30 s grace). Alloy
+  git dep as a wheel (`--require-hashes` refuses VCS lines). Poetry drops `evilflowers-worker[otel]` in an extra
+  when the main deps list the kit too: the lock had no SDK (CI run 44968567266), so the `observability` extra
+  lists the otel packages itself and the Dockerfile import-checks them. `poetry lock` keeps an old git
+  `reference`; `poetry update --lock evilflowers-worker` rewrites it. Role follow-up: knowledge#103 → PR knowledge#104 (comment + explicit 30 s grace). Alloy
   upper-cases the `level` label, so lower-case kit levels need no dashboard change.
 - Python 3.14 lazy annotations: Celery reads `__annotations__`, so `Task[...]` must stay a string.
 - Checks: local pipx Poetry is broken, use `uvx --python 3.14 poetry -C <repo> run pytest|ruff|mypy|black`.

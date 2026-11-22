@@ -23,9 +23,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The kit's `otel` extra: OpenTelemetry SDK, OTLP/HTTP exporter, Celery/requests/system instrumentation.
+# What the kit's `otel` extra lists, spelled out: Poetry merges `evilflowers-worker[otel]` here into the main
+# `evilflowers-worker` dependency and drops the extra, which locked no SDK at all (CI run 44968567266).
+# Keep the versions on the kit's (and the catalog's) release train.
 observability = [
-    "evilflowers-worker[otel] @ git+https://github.com/EvilFlowersCatalog/evilflowers-worker.git@master",
+    "opentelemetry-sdk (==1.45.2)",
+    "opentelemetry-exporter-otlp-proto-http (==1.45.2)",
+    "opentelemetry-instrumentation-celery (==0.66b2)",
+    "opentelemetry-instrumentation-requests (==0.66b2)",
+    "opentelemetry-instrumentation-system-metrics (==0.66b2)",
 ]
 
 [project.scripts]

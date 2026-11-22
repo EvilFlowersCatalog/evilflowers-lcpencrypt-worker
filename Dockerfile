@@ -66,6 +66,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --root-user-action=ignore --require-hashes -r /tmp/requirements.txt \
     && pip install --root-user-action=ignore --no-deps --no-cache-dir /tmp/wheels/*.whl \
     && rm -rf /tmp/wheels
+# Fail the build, not the dashboards, if the lock ever loses the telemetry SDK (without it the kit is a silent no-op).
+RUN python -c "import opentelemetry.sdk, opentelemetry.exporter.otlp.proto.http, opentelemetry.instrumentation.celery, opentelemetry.instrumentation.requests, opentelemetry.instrumentation.system_metrics, evilflowers_worker"
 
 COPY pyproject.toml README.md ./
 COPY evilflowers_lcpencrypt_worker/ evilflowers_lcpencrypt_worker/
